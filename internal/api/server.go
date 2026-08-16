@@ -129,6 +129,78 @@ func (d *Deps) handleRestart(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"operation_id": opID, "status": "running"})
 }
 
+func (d *Deps) handleRollout(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r)
+
+	var body struct {
+		Namespace  string `json:"namespace"`
+		Deployment string `json:"deployment"`
+		Container  string `json:"container"`
+		Image      string `json:"image"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil ||
+		body.Namespace == "" || body.Deployment == "" || body.Image == "" {
+		writeError(w, http.StatusBadRequest, "INVALID_REQUEST", "namespace, deployment and image are required")
+		return
+	}
+
+	if !d.Policy.Authorize(id.Repository, operation.ActionRollout, body.Namespace, body.Deployment) {
+		now := time.Now().UTC()
+		if err := d.Store.PutOperation(r.Context(), &store.Operation{
+			OperationID: operation.NewOperationID(),
+			Repository:  id.Repository, RepositoryID: id.RepositoryID,
+			RepositoryOwner: id.RepositoryOwner, Actor: id.Actor,
+			Workflow: id.Workflow, WorkflowRef: id.WorkflowRef,
+			RunID: id.RunID, RunAttempt: id.RunAttempt, EventName: id.EventName,
+			Action:    operation.ActionRollout,
+			Namespace: body.Namespace, Deployment: body.Deployment,
+			Container: body.Container, Image: body.Image,
+			NsDep:     body.Namespace + "#" + body.Deployment,
+			Status:    store.StatusDenied,
+			ErrorCode: "DENIED",
+			ErrorMessage: "policy does not allow " + operation.ActionRollout +
+				" on " + body.Namespace + "/" + body.Deployment,
+			RequestedAt: now,
+			ExpiresAt:   now.Add(365 * 24 * time.Hour).Unix(),
+			Events:      []store.AuditEvent{{Event: "DENIED", At: now}},
+		}); err != nil {
+			// err is a store-side error (no token/claims content) — surface it so
+			// a denied request never silently vanishes from the audit trail.
+			d.Log.Error("denied audit write failed",
+				"repository", id.Repository,
+				"namespace", body.Namespace, "deployment", body.Deployment, "err", err)
+		}
+		d.Log.Warn("denied", "repository", id.Repository,
+			"namespace", body.Namespace, "deployment", body.Deployment)
+		writeError(w, http.StatusForbidden, "FORBIDDEN", "not allowed")
+		return
+	}
+
+	opID, err := d.Ops.Rollout(r.Context(), id, body.Namespace, body.Deployment, body.Container, body.Image)
+	if err != nil {
+		if errors.Is(err, operation.ErrAmbiguousContainer) {
+			writeError(w, http.StatusBadRequest, "AMBIGUOUS_CONTAINER", operation.ErrAmbiguousContainer.Error())
+			return
+		}
+		if opID == "" {
+			writeError(w, http.StatusServiceUnavailable, "STORE_UNAVAILABLE", "operation could not be recorded")
+			return
+		}
+		// operation exists; patch failed — surface 502 with op id for follow-up
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		json.NewEncoder(w).Encode(map[string]any{
+			"error":        map[string]string{"code": "K8S_UNAVAILABLE", "message": "kubernetes api call failed"},
+			"operation_id": opID,
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(map[string]string{"operation_id": opID, "status": "running"})
+}
+
 func (d *Deps) handleGetOperation(w http.ResponseWriter, r *http.Request) {
 	opID := chi.URLParam(r, "operation_id")
 	op, err := d.Ops.Get(r.Context(), opID)
@@ -178,6 +250,7 @@ func NewRouter(d Deps) http.Handler {
 	r.Group(func(r chi.Router) {
 		r.Use(d.authenticate)
 		r.Post("/v1/deployments/restart", d.handleRestart)
+		r.Post("/v1/deployments/rollout", d.handleRollout)
 		r.Get("/v1/operations/{operation_id}", d.handleGetOperation)
 	})
 	return r

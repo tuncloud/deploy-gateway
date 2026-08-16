@@ -15,17 +15,22 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/watch"
 
 	"github.com/tuncloud/deploy-gateway/internal/api"
 	"github.com/tuncloud/deploy-gateway/internal/authn"
 	"github.com/tuncloud/deploy-gateway/internal/authz"
+	"github.com/tuncloud/deploy-gateway/internal/kube"
 	"github.com/tuncloud/deploy-gateway/internal/operation"
 	"github.com/tuncloud/deploy-gateway/internal/store"
 )
 
 // fakeKube implements kube.Kube for api-level tests without envtest.
-type fakeKube struct{ failPatch bool }
+type fakeKube struct {
+	failPatch  bool
+	containers []corev1.Container
+}
 
 func (f *fakeKube) RestartDeployment(context.Context, string, string) error {
 	if f.failPatch {
@@ -40,7 +45,9 @@ func (f *fakeKube) RolloutDeployment(context.Context, string, string, string, st
 	return nil
 }
 func (f *fakeKube) GetDeployment(context.Context, string, string) (*appsv1.Deployment, error) {
-	return &appsv1.Deployment{}, nil
+	return &appsv1.Deployment{Spec: appsv1.DeploymentSpec{Template: corev1.PodTemplateSpec{
+		Spec: corev1.PodSpec{Containers: f.containers},
+	}}}, nil
 }
 func (f *fakeKube) WatchDeployment(context.Context, string, string) (watch.Interface, error) {
 	return watch.NewFake(), nil
@@ -50,6 +57,11 @@ var errPatch = errors.New("patch failed")
 
 func newDeps(t *testing.T, policyYAML string, failPatch bool) (http.Handler, func() []*store.Operation) {
 	t.Helper()
+	return newDepsK(t, policyYAML, &fakeKube{failPatch: failPatch})
+}
+
+func newDepsK(t *testing.T, policyYAML string, k kube.Kube) (http.Handler, func() []*store.Operation) {
+	t.Helper()
 	path := filepath.Join(t.TempDir(), "p.yaml")
 	os.WriteFile(path, []byte(policyYAML), 0o644)
 	pol, err := authz.LoadPolicy(path)
@@ -57,7 +69,7 @@ func newDeps(t *testing.T, policyYAML string, failPatch bool) (http.Handler, fun
 		t.Fatal(err)
 	}
 	st := store.NewRecording() // wraps NewInMemory, records PutOperation calls
-	m := operation.NewManager(&fakeKube{failPatch: failPatch}, st, slog.Default(), time.Minute)
+	m := operation.NewManager(k, st, slog.Default(), time.Minute)
 	// Static verifier accepts any token; real signature checks are covered by
 	// the authn tests (Task 3).
 	v := authn.NewStaticVerifier(&authn.GitHubIdentity{
@@ -72,6 +84,15 @@ repositories:
   - repository: tuncloud/backend
     permissions:
       - action: deployment.restart
+        namespaces: [backend]
+        deployments: [backend-api]
+`
+
+const rolloutPolicy = `version: 1
+repositories:
+  - repository: tuncloud/backend
+    permissions:
+      - action: deployment.rollout
         namespaces: [backend]
         deployments: [backend-api]
 `
@@ -144,6 +165,95 @@ func TestRestartBadBody400(t *testing.T) {
 	w := doReq(h, http.MethodPost, "/v1/deployments/restart", `{"namespace":""}`, "tok")
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("code = %d, want 400", w.Code)
+	}
+}
+
+func TestRolloutMissingImage400(t *testing.T) {
+	h, _ := newDeps(t, rolloutPolicy, false)
+	w := doReq(h, http.MethodPost, "/v1/deployments/rollout",
+		`{"namespace":"backend","deployment":"backend-api"}`, "tok")
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("code = %d, want 400", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "INVALID_REQUEST") {
+		t.Fatalf("body = %s", w.Body.String())
+	}
+}
+
+// testPolicy grants only deployment.restart — it must not grant rollout.
+func TestRolloutDenied403AuditHasActionRollout(t *testing.T) {
+	h, rec := newDeps(t, testPolicy, false)
+	w := doReq(h, http.MethodPost, "/v1/deployments/rollout",
+		`{"namespace":"backend","deployment":"backend-api","image":"img:v2"}`, "tok")
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("code = %d, want 403", w.Code)
+	}
+	ops := rec()
+	if len(ops) != 1 || ops[0].Status != store.StatusDenied {
+		t.Fatalf("denied audit item not written: %+v", ops)
+	}
+	if ops[0].Action != operation.ActionRollout || ops[0].Image != "img:v2" {
+		t.Fatalf("audit fields = action:%s image:%s", ops[0].Action, ops[0].Image)
+	}
+}
+
+func TestRolloutHappyPath202(t *testing.T) {
+	h, rec := newDepsK(t, rolloutPolicy, &fakeKube{
+		containers: []corev1.Container{{Name: "app", Image: "img:v1"}},
+	})
+	w := doReq(h, http.MethodPost, "/v1/deployments/rollout",
+		`{"namespace":"backend","deployment":"backend-api","image":"img:v2"}`, "tok")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("code = %d, want 202: %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		OperationID string `json:"operation_id"`
+		Status      string
+	}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if !strings.HasPrefix(resp.OperationID, "op_") || resp.Status != "running" {
+		t.Fatalf("resp = %+v", resp)
+	}
+	ops := rec()
+	if len(ops) != 1 {
+		t.Fatalf("want 1 recorded op, got %d", len(ops))
+	}
+	if ops[0].Image != "img:v2" || ops[0].Container != "app" {
+		t.Fatalf("audit fields = image:%s container:%s", ops[0].Image, ops[0].Container)
+	}
+}
+
+func TestRolloutAmbiguousContainer400(t *testing.T) {
+	h, rec := newDepsK(t, rolloutPolicy, &fakeKube{
+		containers: []corev1.Container{{Name: "a"}, {Name: "b"}},
+	})
+	w := doReq(h, http.MethodPost, "/v1/deployments/rollout",
+		`{"namespace":"backend","deployment":"backend-api","image":"img:v2"}`, "tok")
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("code = %d, want 400: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "AMBIGUOUS_CONTAINER") {
+		t.Fatalf("body = %s", w.Body.String())
+	}
+	if ops := rec(); len(ops) != 0 {
+		t.Fatalf("ambiguous request must persist nothing, got %+v", ops)
+	}
+}
+
+func TestRolloutPatchFail502WithOpID(t *testing.T) {
+	h, _ := newDeps(t, rolloutPolicy, true)
+	w := doReq(h, http.MethodPost, "/v1/deployments/rollout",
+		`{"namespace":"backend","deployment":"backend-api","container":"app","image":"img:v2"}`, "tok")
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("code = %d, want 502", w.Code)
+	}
+	var resp struct {
+		Error       map[string]string `json:"error"`
+		OperationID string            `json:"operation_id"`
+	}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp.Error["code"] != "K8S_UNAVAILABLE" || !strings.HasPrefix(resp.OperationID, "op_") {
+		t.Fatalf("resp = %+v", resp)
 	}
 }
 
