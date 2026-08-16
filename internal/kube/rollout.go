@@ -41,8 +41,13 @@ func getCondition(dep *appsv1.Deployment, t appsv1.DeploymentConditionType) *app
 }
 
 func EvaluateRollout(dep *appsv1.Deployment) RolloutEvaluation {
+	// Only trust the ProgressDeadlineExceeded condition when the controller has
+	// observed the current generation — otherwise the condition is a leftover
+	// from a previous rollout (e.g. right after a spec patch bumps Generation)
+	// and must not fail a fresh rollout.
 	if c := getCondition(dep, appsv1.DeploymentProgressing); c != nil &&
-		c.Status == corev1.ConditionFalse && c.Reason == "ProgressDeadlineExceeded" {
+		c.Status == corev1.ConditionFalse && c.Reason == "ProgressDeadlineExceeded" &&
+		dep.Status.ObservedGeneration >= dep.Generation {
 		return RolloutEvaluation{State: RolloutFailed, Reason: "progress deadline exceeded"}
 	}
 

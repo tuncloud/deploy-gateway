@@ -60,6 +60,11 @@ func TestEvaluateRollout(t *testing.T) {
 			want: kube.RolloutFailed,
 		},
 		{
+			name: "stale deadline condition from previous rollout",
+			dep:  deployment(2, 1, 1, 1, 3, "False", "ProgressDeadlineExceeded", 1),
+			want: kube.RolloutProgressing,
+		},
+		{
 			name: "still rolling",
 			dep:  deployment(2, 1, 1, 1, 3, "True", "ReplicaSetUpdated", 2),
 			want: kube.RolloutProgressing,
