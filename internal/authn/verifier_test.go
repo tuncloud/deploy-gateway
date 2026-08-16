@@ -146,3 +146,33 @@ func TestVerifyGarbageToken(t *testing.T) {
 		t.Fatal("garbage token must be rejected")
 	}
 }
+
+func TestVerifyWrongSignature(t *testing.T) {
+	f := newFakeIDP(t)
+	v, _ := authn.NewVerifier(context.Background(), f.srv.URL, audience)
+	// Attacker key, never published in the IDP's JWKS.
+	attackerKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer, err := jose.NewSigner(
+		jose.SigningKey{Algorithm: jose.RS256, Key: attackerKey},
+		(&jose.SignerOptions{}).WithHeader("kid", f.kid),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims := githubClaims(t, f, func(map[string]any) {})
+	payload, _ := json.Marshal(claims)
+	obj, err := signer.Sign(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := obj.CompactSerialize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := v.Verify(context.Background(), token); err == nil {
+		t.Fatal("token signed by key not in JWKS must be rejected")
+	}
+}
