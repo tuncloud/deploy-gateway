@@ -2,6 +2,7 @@ package operation_test
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"testing"
 	"time"
@@ -9,6 +10,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/tuncloud/deploy-gateway/internal/authn"
@@ -224,6 +226,133 @@ func TestGetLazyReconcilesStale(t *testing.T) {
 	}
 	if op.Status != store.StatusTimeout {
 		t.Fatalf("lazy reconcile: want timeout, got %s", op.Status)
+	}
+}
+
+// rolloutFakeKube captures rollout calls and controls Get responses for
+// container resolution tests (no envtest needed).
+type rolloutFakeKube struct {
+	containers    []corev1.Container
+	getErr        error
+	gotContainer  string
+	gotImage      string
+	failRollout   bool
+	rolloutCalled bool
+}
+
+func (f *rolloutFakeKube) RestartDeployment(context.Context, string, string) error { return nil }
+func (f *rolloutFakeKube) RolloutDeployment(_ context.Context, _, _, container, image string) error {
+	f.rolloutCalled, f.gotContainer, f.gotImage = true, container, image
+	if f.failRollout {
+		return errFakeRollout
+	}
+	return nil
+}
+func (f *rolloutFakeKube) GetDeployment(context.Context, string, string) (*appsv1.Deployment, error) {
+	if f.getErr != nil {
+		return nil, f.getErr
+	}
+	return &appsv1.Deployment{
+		Spec: appsv1.DeploymentSpec{Template: corev1.PodTemplateSpec{
+			Spec: corev1.PodSpec{Containers: f.containers},
+		}},
+	}, nil
+}
+func (f *rolloutFakeKube) WatchDeployment(context.Context, string, string) (watch.Interface, error) {
+	return watch.NewFake(), nil
+}
+
+var errFakeRollout = errors.New("fake rollout failure")
+
+func newRolloutManager(k kube.Kube) (*operation.Manager, store.Store) {
+	st := store.NewInMemory()
+	return operation.NewManager(k, st, slog.Default(), time.Minute), st
+}
+
+func TestRolloutHappyPathRecordsImageAndContainer(t *testing.T) {
+	ctx := context.Background()
+	fk := &rolloutFakeKube{containers: []corev1.Container{{Name: "app", Image: "img:v1"}}}
+	m, st := newRolloutManager(fk)
+
+	opID, err := m.Rollout(ctx, identity(), "ns", "api", "", "img:v2")
+	if err != nil || opID == "" {
+		t.Fatalf("rollout: %v (opID=%q)", err, opID)
+	}
+	if !fk.rolloutCalled || fk.gotContainer != "app" || fk.gotImage != "img:v2" {
+		t.Fatalf("kube call = container:%q image:%q called:%v", fk.gotContainer, fk.gotImage, fk.rolloutCalled)
+	}
+	op, _ := st.GetOperation(ctx, opID)
+	if op.Action != operation.ActionRollout || op.Image != "img:v2" || op.Container != "app" {
+		t.Fatalf("audit fields = action:%s image:%s container:%s", op.Action, op.Image, op.Container)
+	}
+}
+
+func TestRolloutExplicitContainerPassedThrough(t *testing.T) {
+	ctx := context.Background()
+	fk := &rolloutFakeKube{containers: []corev1.Container{{Name: "a"}, {Name: "b"}}}
+	m, _ := newRolloutManager(fk)
+
+	if _, err := m.Rollout(ctx, identity(), "ns", "api", "b", "img:v9"); err != nil {
+		t.Fatal(err)
+	}
+	if fk.gotContainer != "b" {
+		t.Fatalf("explicit container ignored: %q", fk.gotContainer)
+	}
+}
+
+func TestRolloutAmbiguousContainerRejectsBeforePersist(t *testing.T) {
+	ctx := context.Background()
+	fk := &rolloutFakeKube{containers: []corev1.Container{{Name: "a"}, {Name: "b"}}}
+	m, st := newRolloutManager(fk)
+
+	opID, err := m.Rollout(ctx, identity(), "ns", "api", "", "img:v2")
+	if !errors.Is(err, operation.ErrAmbiguousContainer) {
+		t.Fatalf("want ErrAmbiguousContainer, got %v", err)
+	}
+	if opID != "" {
+		t.Fatalf("no operation must be persisted, got %q", opID)
+	}
+	if _, err := st.GetOperation(ctx, opID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatal("store must be untouched")
+	}
+	if fk.rolloutCalled {
+		t.Fatal("kube must not be called")
+	}
+}
+
+func TestRolloutResolutionGetFailureRecordsFailedOp(t *testing.T) {
+	ctx := context.Background()
+	fk := &rolloutFakeKube{getErr: errors.New("apiserver down")}
+	m, st := newRolloutManager(fk)
+
+	opID, err := m.Rollout(ctx, identity(), "ns", "ghost", "", "img:v2")
+	if err == nil {
+		t.Fatal("resolution Get failure must surface error")
+	}
+	if opID == "" {
+		t.Fatal("failed resolution must still record operation")
+	}
+	op, _ := st.GetOperation(ctx, opID)
+	if op.Status != store.StatusFailed || op.ErrorCode != "K8S_PATCH_FAILED" {
+		t.Fatalf("op = %s/%s, want failed/K8S_PATCH_FAILED", op.Status, op.ErrorCode)
+	}
+	if op.Action != operation.ActionRollout || op.Image != "img:v2" {
+		t.Fatalf("audit fields = action:%s image:%s", op.Action, op.Image)
+	}
+}
+
+func TestRolloutPatchFailureMarksFailed(t *testing.T) {
+	ctx := context.Background()
+	fk := &rolloutFakeKube{containers: []corev1.Container{{Name: "app"}}, failRollout: true}
+	m, st := newRolloutManager(fk)
+
+	opID, err := m.Rollout(ctx, identity(), "ns", "api", "", "img:v2")
+	if err == nil {
+		t.Fatal("patch failure must surface error")
+	}
+	op, _ := st.GetOperation(ctx, opID)
+	if op.Status != store.StatusFailed || op.ErrorCode != "K8S_PATCH_FAILED" {
+		t.Fatalf("op = %s/%s, want failed/K8S_PATCH_FAILED", op.Status, op.ErrorCode)
 	}
 }
 
