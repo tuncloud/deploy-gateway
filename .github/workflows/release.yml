@@ -1,0 +1,24 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: read
+  packages: write
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - run: go test ./...
+      - name: Build and push image
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u "${{ github.actor }}" --password-stdin
+          IMAGE="ghcr.io/${{ github.repository_owner }}/deploy-gateway"
+          IMAGE="${IMAGE,,}"
+          podman build -t "$IMAGE:${{ github.ref_name }}" -t "$IMAGE:latest" .
+          podman push "$IMAGE:${{ github.ref_name }}"
+          podman push "$IMAGE:latest"
