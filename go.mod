@@ -3,6 +3,11 @@ module github.com/tuncloud/deploy-gateway
 go 1.26.5
 
 require (
-	github.com/go-chi/chi/v5 v5.3.1 // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
+	github.com/go-jose/go-jose/v4 v4.1.4
+	gopkg.in/yaml.v3 v3.0.1
+)
+
+require (
+	github.com/coreos/go-oidc/v3 v3.20.0
+	golang.org/x/oauth2 v0.36.0 // indirect
 )
