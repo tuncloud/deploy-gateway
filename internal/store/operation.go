@@ -18,6 +18,10 @@ const (
 
 var ErrNotFound = errors.New("operation not found")
 
+// ErrAlreadyTerminal: UpdateTerminal refused because the operation is no
+// longer running (another writer resolved it first).
+var ErrAlreadyTerminal = errors.New("operation already terminal")
+
 type AuditEvent struct {
 	Event string    `dynamodbav:"event"`
 	At    time.Time `dynamodbav:"at"`

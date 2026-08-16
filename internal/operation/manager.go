@@ -2,6 +2,7 @@ package operation
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -80,8 +81,18 @@ func (m *Manager) failOperation(opID, code, msg string) {
 		Status: store.StatusFailed, Event: "FAILED",
 		ErrorCode: code, ErrorMessage: msg, CompletedAt: time.Now().UTC(),
 	}); err != nil {
-		m.log.Error("mark operation failed", "operation_id", opID, "err", err)
+		m.logTerminalWriteErr("mark operation failed", opID, err)
 	}
+}
+
+// logTerminalWriteErr: ErrAlreadyTerminal means another writer (watcher vs
+// reconciler vs sweep) resolved the op first — benign, not an error.
+func (m *Manager) logTerminalWriteErr(what, opID string, err error) {
+	if errors.Is(err, store.ErrAlreadyTerminal) {
+		m.log.Info(what+" skipped: already terminal", "operation_id", opID)
+		return
+	}
+	m.log.Error(what, "operation_id", opID, "err", err)
 }
 
 func (m *Manager) progressDeadline(dep *appsv1.Deployment) time.Duration {
@@ -178,7 +189,7 @@ func (m *Manager) completeOperation(opID, reason string) {
 	if err := m.store.UpdateTerminal(context.Background(), opID, store.TerminalUpdate{
 		Status: store.StatusSucceeded, Event: "SUCCEEDED", CompletedAt: time.Now().UTC(),
 	}); err != nil {
-		m.log.Error("mark operation succeeded", "operation_id", opID, "err", err)
+		m.logTerminalWriteErr("mark operation succeeded", opID, err)
 	}
 	m.log.Info("rollout succeeded", "operation_id", opID, "reason", reason)
 }
@@ -188,7 +199,7 @@ func (m *Manager) timeoutOperation(opID, msg string) {
 		Status: store.StatusTimeout, Event: "TIMEOUT",
 		ErrorCode: "TIMEOUT", ErrorMessage: msg, CompletedAt: time.Now().UTC(),
 	}); err != nil {
-		m.log.Error("mark operation timeout", "operation_id", opID, "err", err)
+		m.logTerminalWriteErr("mark operation timeout", opID, err)
 	}
 }
 
@@ -202,5 +213,15 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 }
 
 func (m *Manager) Get(ctx context.Context, opID string) (*store.Operation, error) {
-	return m.store.GetOperation(ctx, opID)
+	op, err := m.store.GetOperation(ctx, opID)
+	if err != nil {
+		return nil, err
+	}
+	if op.Status == store.StatusRunning && time.Since(op.RequestedAt) > staleAfter {
+		m.resolveRunning(ctx, op)
+		if refreshed, err := m.store.GetOperation(ctx, opID); err == nil {
+			return refreshed, nil
+		}
+	}
+	return op, nil
 }

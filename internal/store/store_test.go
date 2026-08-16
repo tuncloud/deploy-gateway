@@ -65,6 +65,35 @@ func TestInMemoryUpdateTerminal(t *testing.T) {
 	}
 }
 
+func TestInMemoryUpdateTerminalAlreadyTerminal(t *testing.T) {
+	s := store.NewInMemory()
+	ctx := context.Background()
+	s.PutOperation(ctx, newOp("op_t1", store.StatusRunning, time.Now()))
+
+	err := s.UpdateTerminal(ctx, "op_t1", store.TerminalUpdate{
+		Status: store.StatusSucceeded, Event: "SUCCEEDED", CompletedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("first terminal write on running op: %v", err)
+	}
+
+	// second writer races in (watcher vs reconciler) — must be rejected,
+	// not silently overwrite the first terminal outcome.
+	err = s.UpdateTerminal(ctx, "op_t1", store.TerminalUpdate{
+		Status: store.StatusTimeout, Event: "TIMEOUT", CompletedAt: time.Now(),
+	})
+	if !errors.Is(err, store.ErrAlreadyTerminal) {
+		t.Fatalf("want ErrAlreadyTerminal, got %v", err)
+	}
+	got, _ := s.GetOperation(ctx, "op_t1")
+	if got.Status != store.StatusSucceeded {
+		t.Fatalf("status = %s, want original succeeded preserved", got.Status)
+	}
+	if n := len(got.Events); n != 1 {
+		t.Fatalf("events = %d, want 1 (rejected write must not append)", n)
+	}
+}
+
 func TestInMemoryListRunningPastDeadline(t *testing.T) {
 	s := store.NewInMemory()
 	ctx := context.Background()

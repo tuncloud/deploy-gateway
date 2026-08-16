@@ -135,6 +135,98 @@ func TestRestartRolloutFailed(t *testing.T) {
 	})
 }
 
+func TestReconcileSweepResolvesStaleRunning(t *testing.T) {
+	ctx := context.Background()
+	m, st, _ := setup(t)
+
+	// stale running op whose deployment is actually complete
+	stale := &store.Operation{
+		OperationID: "op_stale", Repository: "tuncloud/backend", RepositoryID: "1",
+		Action: operation.ActionRestart, Namespace: "gone-ns", Deployment: "api",
+		NsDep: "gone-ns#api", Status: store.StatusRunning,
+		RequestedAt: time.Now().Add(-3 * time.Hour),
+		ExpiresAt:   time.Now().Add(365 * 24 * time.Hour).Unix(),
+	}
+	st.PutOperation(ctx, stale)
+
+	m.ReconcileSweep(ctx)
+
+	op, err := st.GetOperation(ctx, "op_stale")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if op.Status != store.StatusTimeout {
+		t.Fatalf("deployment gone + stale → want timeout, got %s", op.Status)
+	}
+}
+
+func TestReconcileSweepResolvesCompleted(t *testing.T) {
+	ctx := context.Background()
+	m, st, cs := setup(t)
+	ns := "recon-ns"
+	cs.CoreV1().Namespaces().Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}, metav1.CreateOptions{})
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "api", Namespace: ns},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: ptr32(1),
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "api"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "api"}},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "busybox"}}},
+			},
+		},
+	}
+	if _, err := cs.AppsV1().Deployments(ns).Create(ctx, dep, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	// apiserver strips status on Create; set the completed shape via UpdateStatus.
+	got, _ := cs.AppsV1().Deployments(ns).Get(ctx, "api", metav1.GetOptions{})
+	got.Status.Replicas = 1
+	got.Status.ObservedGeneration = got.Generation
+	got.Status.UpdatedReplicas = 1
+	got.Status.ReadyReplicas = 1
+	got.Status.AvailableReplicas = 1
+	if _, err := cs.AppsV1().Deployments(ns).UpdateStatus(ctx, got, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	stale := &store.Operation{
+		OperationID: "op_recon", Repository: "tuncloud/backend", RepositoryID: "1",
+		Action: operation.ActionRestart, Namespace: ns, Deployment: "api",
+		NsDep: ns + "#api", Status: store.StatusRunning,
+		RequestedAt: time.Now().Add(-3 * time.Hour),
+		ExpiresAt:   time.Now().Add(365 * 24 * time.Hour).Unix(),
+	}
+	st.PutOperation(ctx, stale)
+
+	m.ReconcileSweep(ctx)
+
+	op, _ := st.GetOperation(ctx, "op_recon")
+	if op.Status != store.StatusSucceeded {
+		t.Fatalf("deployment complete + stale → want succeeded, got %s", op.Status)
+	}
+}
+
+func TestGetLazyReconcilesStale(t *testing.T) {
+	ctx := context.Background()
+	m, st, _ := setup(t)
+	st.PutOperation(ctx, &store.Operation{
+		OperationID: "op_lazy", Repository: "r", RepositoryID: "1",
+		Action: operation.ActionRestart, Namespace: "gone", Deployment: "d",
+		NsDep: "gone#d", Status: store.StatusRunning,
+		RequestedAt: time.Now().Add(-2 * time.Hour),
+		ExpiresAt:   time.Now().Add(365 * 24 * time.Hour).Unix(),
+	})
+
+	op, err := m.Get(ctx, "op_lazy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if op.Status != store.StatusTimeout {
+		t.Fatalf("lazy reconcile: want timeout, got %s", op.Status)
+	}
+}
+
 func waitFor(t *testing.T, d time.Duration, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(d)

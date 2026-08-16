@@ -65,9 +65,13 @@ func (d *dynamoStore) UpdateTerminal(ctx context.Context, id string, upd Termina
 		TableName:        &d.table,
 		Key:              map[string]types.AttributeValue{"operation_id": &types.AttributeValueMemberS{Value: id}},
 		UpdateExpression: aws.String(expr),
-		ExpressionAttributeNames: map[string]string{"#st": "status"},
+		// Guard against racing writers (watcher vs reconciler): only the first
+		// terminal write wins, later ones fail the condition.
+		ConditionExpression:       aws.String("#st = :running"),
+		ExpressionAttributeNames:  map[string]string{"#st": "status"},
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":st": &types.AttributeValueMemberS{Value: string(upd.Status)},
+			":st":      &types.AttributeValueMemberS{Value: string(upd.Status)},
+			":running": &types.AttributeValueMemberS{Value: string(StatusRunning)},
 			":ev": &types.AttributeValueMemberL{Value: []types.AttributeValue{
 				&types.AttributeValueMemberM{Value: map[string]types.AttributeValue{
 					"event": &types.AttributeValueMemberS{Value: upd.Event},
@@ -84,6 +88,10 @@ func (d *dynamoStore) UpdateTerminal(ctx context.Context, id string, upd Termina
 		var nf *types.ResourceNotFoundException
 		if errors.As(err, &nf) {
 			return ErrNotFound
+		}
+		var ccfe *types.ConditionalCheckFailedException
+		if errors.As(err, &ccfe) {
+			return ErrAlreadyTerminal
 		}
 		return fmt.Errorf("update: %w", err)
 	}

@@ -41,6 +41,9 @@ func (s *inMemory) UpdateTerminal(_ context.Context, id string, upd TerminalUpda
 	if !ok {
 		return ErrNotFound
 	}
+	if op.Status != StatusRunning {
+		return ErrAlreadyTerminal
+	}
 	op.Status = upd.Status
 	op.ErrorCode = upd.ErrorCode
 	op.ErrorMessage = upd.ErrorMessage
