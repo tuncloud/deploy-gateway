@@ -56,14 +56,27 @@ jobs:
           deadline=$(( SECONDS + TIMEOUT ))
           while [ $SECONDS -lt $deadline ]; do
             sleep 5
-            op=$(curl -sS -H "Authorization: Bearer $GATEWAY_TOKEN" \
+            resp=$(curl -sS -w '\n%{http_code}' -H "Authorization: Bearer $GATEWAY_TOKEN" \
               "https://gateway.tuando.app/v1/operations/$op_id")
-            status=$(echo "$op" | jq -r '.status')
+            body=$(echo "$resp" | head -n -1)
+            code=$(echo "$resp" | tail -n 1)
+            # Fail fast on transport/auth errors: jq over an empty/401 body
+            # yields "null", falls through the case, and the job would spin to
+            # the deadline reporting "timed out" while the op actually succeeded.
+            if [ "$code" != "200" ]; then
+              if [ "$code" = "401" ]; then
+                echo "gateway auth failed during polling (token expired?)" >&2
+              else
+                echo "polling GET for $op_id returned HTTP $code: $body" >&2
+              fi
+              exit 1
+            fi
+            status=$(echo "$body" | jq -r '.status')
             echo "status: $status"
             case "$status" in
               succeeded) exit 0 ;;
               failed|timeout|denied)
-                echo "$op" | jq . >&2
+                echo "$body" | jq . >&2
                 exit 1 ;;
             esac
           done

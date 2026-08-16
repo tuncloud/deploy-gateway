@@ -2,6 +2,7 @@ package operation
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/tuncloud/deploy-gateway/internal/kube"
@@ -44,6 +45,15 @@ func (m *Manager) ReconcileSweep(ctx context.Context) {
 func (m *Manager) resolveRunning(ctx context.Context, op *store.Operation) {
 	dep, err := m.kube.GetDeployment(ctx, op.Namespace, op.Deployment)
 	if err != nil {
+		// A canceled/dead context (HTTP client aborted a lazy GET, sweeper
+		// winding down on SIGTERM) says nothing about the deployment — a
+		// terminal timeout write here could kill a healthy op. Skip; a later
+		// sweep or GET retries with a live context.
+		if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+			m.log.Warn("resolve skipped: context done",
+				"operation_id", op.OperationID, "err", err)
+			return
+		}
 		m.timeoutOperation(op.OperationID, "deployment no longer readable while operation running: "+err.Error())
 		return
 	}

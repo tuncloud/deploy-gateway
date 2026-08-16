@@ -79,7 +79,7 @@ func (d *Deps) handleRestart(w http.ResponseWriter, r *http.Request) {
 
 	if !d.Policy.Authorize(id.Repository, id.RepositoryID, operation.ActionRestart, body.Namespace, body.Deployment) {
 		now := time.Now().UTC()
-		_ = d.Store.PutOperation(r.Context(), &store.Operation{
+		if err := d.Store.PutOperation(r.Context(), &store.Operation{
 			OperationID: operation.NewOperationID(),
 			Repository:  id.Repository, RepositoryID: id.RepositoryID,
 			RepositoryOwner: id.RepositoryOwner, Actor: id.Actor,
@@ -95,7 +95,13 @@ func (d *Deps) handleRestart(w http.ResponseWriter, r *http.Request) {
 			RequestedAt: now,
 			ExpiresAt:   now.Add(365 * 24 * time.Hour).Unix(),
 			Events:      []store.AuditEvent{{Event: "DENIED", At: now}},
-		})
+		}); err != nil {
+			// err is a store-side error (no token/claims content) — surface it so
+			// a denied request never silently vanishes from the audit trail.
+			d.Log.Error("denied audit write failed",
+				"repository", id.Repository,
+				"namespace", body.Namespace, "deployment", body.Deployment, "err", err)
+		}
 		d.Log.Warn("denied", "repository", id.Repository,
 			"namespace", body.Namespace, "deployment", body.Deployment)
 		writeError(w, http.StatusForbidden, "FORBIDDEN", "not allowed")

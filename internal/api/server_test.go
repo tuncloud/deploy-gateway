@@ -1,6 +1,7 @@
 package api_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -176,5 +177,84 @@ func TestHealthzStillWorks(t *testing.T) {
 	w := doReq(h, http.MethodGet, "/healthz", "", "")
 	if w.Code != 200 {
 		t.Fatalf("code = %d", w.Code)
+	}
+}
+
+// failingVerifier rejects every token with an error carrying sentinel detail
+// (claims internals) that must never reach the response body or logs.
+type failingVerifier struct{ err error }
+
+func (f failingVerifier) Verify(_ context.Context, _ string) (*authn.GitHubIdentity, error) {
+	return nil, f.err
+}
+
+// putFailStore fails every PutOperation; used to prove a broken audit store
+// still yields 403 and logs the write failure.
+type putFailStore struct{ store.Store }
+
+func (putFailStore) PutOperation(context.Context, *store.Operation) error {
+	return errors.New("dynamo backpressure")
+}
+
+func newDepsCustom(t *testing.T, v api.TokenVerifier, st store.Store, log *slog.Logger) http.Handler {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "p.yaml")
+	os.WriteFile(path, []byte(testPolicy), 0o644)
+	pol, err := authz.LoadPolicy(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := operation.NewManager(&fakeKube{}, st, log, time.Minute)
+	return api.NewRouter(api.Deps{Verifier: v, Policy: pol, Ops: m, Store: st, Log: log})
+}
+
+func TestRestartRejectedToken401GenericBodyNoEcho(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+	verr := errors.New("AUDIENCE bob evil-token-claims")
+	h := newDepsCustom(t, failingVerifier{err: verr}, store.NewRecording(), logger)
+
+	w := doReq(h, http.MethodPost, "/v1/deployments/restart",
+		`{"namespace":"backend","deployment":"backend-api"}`, "forged.jwt.value")
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("code = %d, want 401", w.Code)
+	}
+	want := "{\"error\":{\"code\":\"UNAUTHENTICATED\",\"message\":\"invalid token\"}}\n"
+	if w.Body.String() != want {
+		t.Fatalf("body = %q, want exact generic 401 body %q", w.Body.String(), want)
+	}
+	for _, leak := range []string{"AUDIENCE", "evil-token-claims", "forged.jwt.value", verr.Error()} {
+		if strings.Contains(w.Body.String(), leak) {
+			t.Fatalf("sensitive detail %q leaked into response body", leak)
+		}
+		if strings.Contains(logBuf.String(), leak) {
+			t.Fatalf("sensitive detail %q leaked into logs: %s", leak, logBuf.String())
+		}
+	}
+	if !strings.Contains(logBuf.String(), "token rejected") {
+		t.Fatalf("expected rejection log entry, got: %s", logBuf.String())
+	}
+}
+
+func TestRestartDeniedAuditWriteFailureStill403(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+	h := newDepsCustom(t, authn.NewStaticVerifier(&authn.GitHubIdentity{
+		Repository: "tuncloud/backend", RepositoryID: "123", Actor: "tuando",
+		RunID: "1", RunAttempt: "1", EventName: "push", Workflow: "deploy.yml",
+	}), putFailStore{store.NewRecording()}, logger)
+
+	w := doReq(h, http.MethodPost, "/v1/deployments/restart",
+		`{"namespace":"kube-system","deployment":"coredns"}`, "tok")
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("code = %d, want 403 even when audit write fails", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "FORBIDDEN") {
+		t.Fatalf("body = %s", w.Body.String())
+	}
+	if !strings.Contains(logBuf.String(), "denied audit write failed") {
+		t.Fatalf("expected audit-write failure log, got: %s", logBuf.String())
 	}
 }

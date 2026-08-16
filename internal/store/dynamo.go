@@ -13,9 +13,19 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
+// dynamoAPI is the slice of the SDK client the store needs. Extracted so
+// Scan pagination is unit-testable without a live DynamoDB (v1.63.x of the
+// SDK no longer ships generated per-operation client interfaces).
+type dynamoAPI interface {
+	PutItem(ctx context.Context, in *dynamodb.PutItemInput, opts ...func(*dynamodb.Options)) (*dynamodb.PutItemOutput, error)
+	GetItem(ctx context.Context, in *dynamodb.GetItemInput, opts ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error)
+	UpdateItem(ctx context.Context, in *dynamodb.UpdateItemInput, opts ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error)
+	Scan(ctx context.Context, in *dynamodb.ScanInput, opts ...func(*dynamodb.Options)) (*dynamodb.ScanOutput, error)
+}
+
 type dynamoStore struct {
 	table  string
-	client *dynamodb.Client
+	client dynamoAPI
 }
 
 // NewDynamo loads region + credentials via the default AWS env chain.
@@ -100,28 +110,39 @@ func (d *dynamoStore) UpdateTerminal(ctx context.Context, id string, upd Termina
 
 func (d *dynamoStore) ListRunningPastDeadline(ctx context.Context, olderThan time.Time) ([]*Operation, error) {
 	// Table is tiny (a few items/day); Scan with filter is correct and cheap here.
-	out, err := d.client.Scan(ctx, &dynamodb.ScanInput{
-		TableName:                 &d.table,
-		FilterExpression:          aws.String("#st = :running AND requested_at < :t"),
-		ExpressionAttributeNames:  map[string]string{"#st": "status"},
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":running": &types.AttributeValueMemberS{Value: string(StatusRunning)},
-			":t":       &types.AttributeValueMemberS{Value: olderThan.UTC().Format(time.RFC3339Nano)},
-		},
-		Limit: aws.Int32(100),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("scan: %w", err)
-	}
-	ops := make([]*Operation, 0, len(out.Items))
-	for _, item := range out.Items {
-		var op Operation
-		if err := attributevalue.UnmarshalMap(item, &op); err != nil {
-			return nil, fmt.Errorf("unmarshal scan item: %w", err)
+	// Scan Limit counts items EVALUATED, not matched — terminal items (365d TTL)
+	// can fill many pages before a running one appears in scan order, so we must
+	// loop on LastEvaluatedKey or orphaned running ops past page one are never
+	// swept (violates "no op stuck running forever").
+	ops := []*Operation{}
+	var start map[string]types.AttributeValue
+	for {
+		out, err := d.client.Scan(ctx, &dynamodb.ScanInput{
+			TableName:                 &d.table,
+			FilterExpression:          aws.String("#st = :running AND requested_at < :t"),
+			ExpressionAttributeNames:  map[string]string{"#st": "status"},
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":running": &types.AttributeValueMemberS{Value: string(StatusRunning)},
+				":t":       &types.AttributeValueMemberS{Value: olderThan.UTC().Format(time.RFC3339Nano)},
+			},
+			Limit:             aws.Int32(100),
+			ExclusiveStartKey: start,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("scan: %w", err)
 		}
-		ops = append(ops, &op)
+		for _, item := range out.Items {
+			var op Operation
+			if err := attributevalue.UnmarshalMap(item, &op); err != nil {
+				return nil, fmt.Errorf("unmarshal scan item: %w", err)
+			}
+			ops = append(ops, &op)
+		}
+		if out.LastEvaluatedKey == nil {
+			return ops, nil
+		}
+		start = out.LastEvaluatedKey
 	}
-	return ops, nil
 }
 
 func (d *dynamoStore) Ping(ctx context.Context) error {
