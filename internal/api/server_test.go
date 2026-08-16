@@ -33,6 +33,12 @@ func (f *fakeKube) RestartDeployment(context.Context, string, string) error {
 	}
 	return nil
 }
+func (f *fakeKube) RolloutDeployment(context.Context, string, string, string, string) error {
+	if f.failPatch {
+		return errPatch
+	}
+	return nil
+}
 func (f *fakeKube) GetDeployment(context.Context, string, string) (*appsv1.Deployment, error) {
 	return &appsv1.Deployment{}, nil
 }

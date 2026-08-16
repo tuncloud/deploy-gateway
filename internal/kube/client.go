@@ -18,6 +18,7 @@ import (
 // Kube is the subset of the Kubernetes API the gateway needs.
 type Kube interface {
 	RestartDeployment(ctx context.Context, namespace, name string) error
+	RolloutDeployment(ctx context.Context, namespace, name, container, image string) error
 	GetDeployment(ctx context.Context, namespace, name string) (*appsv1.Deployment, error)
 	WatchDeployment(ctx context.Context, namespace, name string) (watch.Interface, error)
 }
@@ -53,6 +54,24 @@ func (c *client) RestartDeployment(ctx context.Context, namespace, name string) 
 		patch := fmt.Sprintf(
 			`{"spec":{"template":{"metadata":{"annotations":{"kubectl.kubernetes.io/restartedAt":%q}}}}}`,
 			time.Now().UTC().Format(time.RFC3339),
+		)
+		_, err := c.deployments(namespace).Patch(
+			ctx, name, types.StrategicMergePatchType, []byte(patch), metav1.PatchOptions{})
+		return err
+	})
+}
+
+// RolloutDeployment sets a container's image via strategic merge patch
+// (containers merge by name, so other containers and fields are untouched).
+// No restartedAt annotation: the template change alone rolls the deployment.
+func (c *client) RolloutDeployment(ctx context.Context, namespace, name, container, image string) error {
+	if container == "" || image == "" {
+		return fmt.Errorf("rollout requires container and image")
+	}
+	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		patch := fmt.Sprintf(
+			`{"spec":{"template":{"spec":{"containers":[{"name":%q,"image":%q}]}}}}`,
+			container, image,
 		)
 		_, err := c.deployments(namespace).Patch(
 			ctx, name, types.StrategicMergePatchType, []byte(patch), metav1.PatchOptions{})

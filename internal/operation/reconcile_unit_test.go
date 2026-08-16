@@ -19,6 +19,9 @@ import (
 type getErrKube struct{ getErr error }
 
 func (g *getErrKube) RestartDeployment(context.Context, string, string) error { return nil }
+func (g *getErrKube) RolloutDeployment(context.Context, string, string, string, string) error {
+	return nil
+}
 func (g *getErrKube) GetDeployment(context.Context, string, string) (*appsv1.Deployment, error) {
 	return nil, g.getErr
 }

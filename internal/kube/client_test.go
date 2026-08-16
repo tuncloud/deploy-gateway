@@ -66,6 +66,91 @@ func TestRestartDeploymentSetsAnnotation(t *testing.T) {
 	}
 }
 
+func TestRolloutUpdatesImageSingleContainer(t *testing.T) {
+	cfg, cs := kubetest.Start(t)
+	ctx := context.Background()
+	ns := "rollout-ns"
+	if _, err := cs.CoreV1().Namespaces().Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cs.AppsV1().Deployments(ns).Create(ctx, makeDeployment("api", ns), metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	k, err := kube.NewFromConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := k.RolloutDeployment(ctx, ns, "api", "c", "busybox:2"); err != nil {
+		t.Fatal(err)
+	}
+
+	after, err := cs.AppsV1().Deployments(ns).Get(ctx, "api", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := after.Spec.Template.Spec.Containers[0].Image; got != "busybox:2" {
+		t.Fatalf("image = %q, want busybox:2", got)
+	}
+	if _, ok := after.Spec.Template.Annotations["kubectl.kubernetes.io/restartedAt"]; ok {
+		t.Fatal("rollout must not set restartedAt")
+	}
+}
+
+func TestRolloutMergesByNameLeavesOtherContainers(t *testing.T) {
+	cfg, cs := kubetest.Start(t)
+	ctx := context.Background()
+	ns := "rollout-multi-ns"
+	if _, err := cs.CoreV1().Namespaces().Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	dep := makeDeployment("api", ns)
+	dep.Spec.Template.Spec.Containers = append(
+		dep.Spec.Template.Spec.Containers,
+		corev1.Container{Name: "sidecar", Image: "proxy:1"},
+	)
+	if _, err := cs.AppsV1().Deployments(ns).Create(ctx, dep, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	k, err := kube.NewFromConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := k.RolloutDeployment(ctx, ns, "api", "sidecar", "proxy:2"); err != nil {
+		t.Fatal(err)
+	}
+
+	after, err := cs.AppsV1().Deployments(ns).Get(ctx, "api", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]string{}
+	for _, c := range after.Spec.Template.Spec.Containers {
+		byName[c.Name] = c.Image
+	}
+	if byName["sidecar"] != "proxy:2" {
+		t.Fatalf("sidecar image = %q, want proxy:2", byName["sidecar"])
+	}
+	if byName["c"] != "busybox" {
+		t.Fatalf("main container image = %q, want untouched busybox", byName["c"])
+	}
+}
+
+func TestRolloutRequiresContainerAndImage(t *testing.T) {
+	cfg, _ := kubetest.Start(t)
+	k, err := kube.NewFromConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := k.RolloutDeployment(context.Background(), "ns", "dep", "", "img"); err == nil {
+		t.Fatal("empty container must error")
+	}
+	if err := k.RolloutDeployment(context.Background(), "ns", "dep", "c", ""); err == nil {
+		t.Fatal("empty image must error")
+	}
+}
+
 func TestRestartMissingDeploymentFails(t *testing.T) {
 	cfg, _ := kubetest.Start(t)
 	k, _ := kube.NewFromConfig(cfg)
