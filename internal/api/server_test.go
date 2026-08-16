@@ -172,6 +172,24 @@ func TestGetOperationNotFound404(t *testing.T) {
 	}
 }
 
+func TestReadyzStoreFailure503LogsCause(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+	h := newDepsCustom(t, authn.NewStaticVerifier(&authn.GitHubIdentity{}),
+		pingFailStore{store.NewInMemory()}, logger)
+
+	w := doReq(h, http.MethodGet, "/readyz", "", "")
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("code = %d, want 503", w.Code)
+	}
+	if strings.Contains(w.Body.String(), "AccessDeniedException") {
+		t.Fatalf("store error leaked into response: %s", w.Body.String())
+	}
+	if !strings.Contains(logBuf.String(), "readiness check failed") ||
+		!strings.Contains(logBuf.String(), "AccessDeniedException") {
+		t.Fatalf("expected readiness failure log, got: %s", logBuf.String())
+	}
+}
 func TestHealthzStillWorks(t *testing.T) {
 	h, _ := newDeps(t, testPolicy, false)
 	w := doReq(h, http.MethodGet, "/healthz", "", "")
@@ -194,6 +212,12 @@ type putFailStore struct{ store.Store }
 
 func (putFailStore) PutOperation(context.Context, *store.Operation) error {
 	return errors.New("dynamo backpressure")
+}
+
+type pingFailStore struct{ store.Store }
+
+func (pingFailStore) Ping(context.Context) error {
+	return errors.New("dynamodb: AccessDeniedException")
 }
 
 func newDepsCustom(t *testing.T, v api.TokenVerifier, st store.Store, log *slog.Logger) http.Handler {

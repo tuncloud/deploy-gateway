@@ -85,11 +85,11 @@ func (d *Deps) handleRestart(w http.ResponseWriter, r *http.Request) {
 			RepositoryOwner: id.RepositoryOwner, Actor: id.Actor,
 			Workflow: id.Workflow, WorkflowRef: id.WorkflowRef,
 			RunID: id.RunID, RunAttempt: id.RunAttempt, EventName: id.EventName,
-			Action: operation.ActionRestart,
+			Action:    operation.ActionRestart,
 			Namespace: body.Namespace, Deployment: body.Deployment,
-			NsDep:       body.Namespace + "#" + body.Deployment,
-			Status:      store.StatusDenied,
-			ErrorCode:   "DENIED",
+			NsDep:     body.Namespace + "#" + body.Deployment,
+			Status:    store.StatusDenied,
+			ErrorCode: "DENIED",
 			ErrorMessage: "policy does not allow " + operation.ActionRestart +
 				" on " + body.Namespace + "/" + body.Deployment,
 			RequestedAt: now,
@@ -160,6 +160,7 @@ func errBody(op *store.Operation) map[string]string {
 
 func (d *Deps) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	if err := d.Store.Ping(r.Context()); err != nil {
+		d.Log.Error("readiness check failed", "err", err)
 		writeError(w, http.StatusServiceUnavailable, "STORE_UNAVAILABLE", "store not reachable")
 		return
 	}
