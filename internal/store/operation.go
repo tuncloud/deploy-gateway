@@ -41,6 +41,8 @@ type Operation struct {
 	Action          string          `dynamodbav:"action"`
 	Namespace       string          `dynamodbav:"namespace"`
 	Deployment      string          `dynamodbav:"deployment"`
+	Container       string          `dynamodbav:"container,omitempty"`
+	Image           string          `dynamodbav:"image,omitempty"`
 	NsDep           string          `dynamodbav:"ns_dep"`
 	Status          OperationStatus `dynamodbav:"status"`
 	ErrorCode       string          `dynamodbav:"error_code,omitempty"`

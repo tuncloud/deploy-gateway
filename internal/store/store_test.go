@@ -34,6 +34,34 @@ func TestInMemoryPutGet(t *testing.T) {
 	}
 }
 
+func TestInMemoryPutGetRolloutFields(t *testing.T) {
+	s := store.NewInMemory()
+	ctx := context.Background()
+	op := newOp("op_roll", store.StatusRunning, time.Now())
+	op.Action = "deployment.rollout"
+	op.Container = "app"
+	op.Image = "ghcr.io/tuncloud/api:v2"
+	if err := s.PutOperation(ctx, op); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetOperation(ctx, "op_roll")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Action != "deployment.rollout" || got.Container != "app" || got.Image != "ghcr.io/tuncloud/api:v2" {
+		t.Fatalf("rollout fields lost: action=%s container=%s image=%s", got.Action, got.Container, got.Image)
+	}
+
+	plain := newOp("op_restart", store.StatusRunning, time.Now())
+	if err := s.PutOperation(ctx, plain); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = s.GetOperation(ctx, "op_restart")
+	if got.Container != "" || got.Image != "" {
+		t.Fatalf("restart op must keep container/image empty: %+v", got)
+	}
+}
+
 func TestInMemoryGetNotFound(t *testing.T) {
 	s := store.NewInMemory()
 	if _, err := s.GetOperation(context.Background(), "missing"); !errors.Is(err, store.ErrNotFound) {
