@@ -67,3 +67,23 @@ func (s *inMemory) ListRunningPastDeadline(_ context.Context, olderThan time.Tim
 }
 
 func (s *inMemory) Ping(_ context.Context) error { return nil }
+
+// RecordingStore wraps the in-memory store and records PutOperation calls so
+// tests can assert audit items (e.g. denied requests) were persisted.
+type RecordingStore struct {
+	*inMemory
+	puts []*Operation
+	mu   sync.Mutex
+}
+
+func NewRecording() *RecordingStore { return &RecordingStore{inMemory: NewInMemory().(*inMemory)} }
+
+func (r *RecordingStore) PutOperation(ctx context.Context, op *Operation) error {
+	r.mu.Lock()
+	r.puts = append(r.puts, op)
+	r.mu.Unlock()
+	return r.inMemory.PutOperation(ctx, op)
+}
+func (r *RecordingStore) Recorder() func() []*Operation {
+	return func() []*Operation { r.mu.Lock(); defer r.mu.Unlock(); return append([]*Operation{}, r.puts...) }
+}
