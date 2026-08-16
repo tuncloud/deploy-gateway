@@ -1,0 +1,71 @@
+name: restart-deployment
+on:
+  workflow_call:
+    inputs:
+      namespace:
+        required: true
+        type: string
+        description: Kubernetes namespace of the deployment
+      deployment:
+        required: true
+        type: string
+        description: Deployment name to restart
+      timeout-seconds:
+        required: false
+        type: number
+        default: 600
+        description: Max seconds to wait for rollout completion
+
+jobs:
+  restart:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Request OIDC token
+        id: oidc
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const token = await core.getIDToken('https://gateway.tuando.app');
+            core.setSecret(token);
+            core.setOutput('token', token);
+
+      - name: Restart via deploy gateway
+        env:
+          GATEWAY_TOKEN: ${{ steps.oidc.outputs.token }}
+          NS: ${{ inputs.namespace }}
+          DEP: ${{ inputs.deployment }}
+          TIMEOUT: ${{ inputs.timeout-seconds }}
+        run: |
+          set -euo pipefail
+          resp=$(curl -sS -w '\n%{http_code}' -X POST https://gateway.tuando.app/v1/deployments/restart \
+            -H "Authorization: Bearer $GATEWAY_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"namespace\":\"$NS\",\"deployment\":\"$DEP\"}")
+          body=$(echo "$resp" | head -n -1)
+          code=$(echo "$resp" | tail -n 1)
+          if [ "$code" != "202" ]; then
+            echo "gateway returned $code: $body" >&2
+            exit 1
+          fi
+          op_id=$(echo "$body" | jq -r '.operation_id')
+          echo "operation: $op_id"
+
+          deadline=$(( SECONDS + TIMEOUT ))
+          while [ $SECONDS -lt $deadline ]; do
+            sleep 5
+            op=$(curl -sS -H "Authorization: Bearer $GATEWAY_TOKEN" \
+              "https://gateway.tuando.app/v1/operations/$op_id")
+            status=$(echo "$op" | jq -r '.status')
+            echo "status: $status"
+            case "$status" in
+              succeeded) exit 0 ;;
+              failed|timeout|denied)
+                echo "$op" | jq . >&2
+                exit 1 ;;
+            esac
+          done
+          echo "timed out waiting for operation $op_id" >&2
+          exit 1

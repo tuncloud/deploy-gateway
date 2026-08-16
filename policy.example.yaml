@@ -1,0 +1,11 @@
+# Copy to ConfigMap deploy-gateway-policy in namespace platform-system.
+# repository_id is the numeric GitHub repository ID (quoted — it is compared
+# as a string against the OIDC claim).
+version: 1
+repositories:
+  - repository: tuncloud/example-app
+    repository_id: "000000000"
+    permissions:
+      - action: deployment.restart
+        namespaces: [example]
+        deployments: [example-web]
