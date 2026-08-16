@@ -6,3 +6,6 @@ repositories:
       - action: deployment.restart
         namespaces: [example]
         deployments: [example-web]
+      - action: deployment.rollout
+        namespaces: [example]
+        deployments: [example-web]

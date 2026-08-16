@@ -1,0 +1,104 @@
+name: rollout-deployment
+on:
+  workflow_call:
+    inputs:
+      namespace:
+        required: true
+        type: string
+        description: Kubernetes namespace of the deployment
+      deployment:
+        required: true
+        type: string
+        description: Deployment name to update
+      image:
+        required: true
+        type: string
+        description: New container image (e.g. ghcr.io/org/app:sha-abc1234)
+      container:
+        required: false
+        type: string
+        default: ""
+        description: Container name; defaults to the only container, required when the pod has multiple
+      timeout-seconds:
+        required: false
+        type: number
+        default: 600
+        description: Max seconds to wait for rollout completion
+
+jobs:
+  rollout:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Request OIDC token
+        id: oidc
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const token = await core.getIDToken('https://gateway.tuando.app');
+            core.setSecret(token);
+            core.setOutput('token', token);
+
+      - name: Rollout via deploy gateway
+        env:
+          GATEWAY_TOKEN: ${{ steps.oidc.outputs.token }}
+          NS: ${{ inputs.namespace }}
+          DEP: ${{ inputs.deployment }}
+          IMG: ${{ inputs.image }}
+          CTR: ${{ inputs.container }}
+          TIMEOUT: ${{ inputs.timeout-seconds }}
+        run: |
+          set -euo pipefail
+          # Omit the container key entirely when unset — the gateway resolves
+          # the single container itself; an explicit "" would fail validation.
+          if [ -n "$CTR" ]; then
+            payload=$(jq -nc --arg ns "$NS" --arg dep "$DEP" --arg img "$IMG" --arg ctr "$CTR" \
+              '{namespace:$ns, deployment:$dep, image:$img, container:$ctr}')
+          else
+            payload=$(jq -nc --arg ns "$NS" --arg dep "$DEP" --arg img "$IMG" \
+              '{namespace:$ns, deployment:$dep, image:$img}')
+          fi
+          resp=$(curl -sS -w '\n%{http_code}' -X POST https://gateway.tuando.app/v1/deployments/rollout \
+            -H "Authorization: Bearer $GATEWAY_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$payload")
+          body=$(echo "$resp" | head -n -1)
+          code=$(echo "$resp" | tail -n 1)
+          if [ "$code" != "202" ]; then
+            echo "gateway returned $code: $body" >&2
+            exit 1
+          fi
+          op_id=$(echo "$body" | jq -r '.operation_id')
+          echo "operation: $op_id"
+
+          deadline=$(( SECONDS + TIMEOUT ))
+          while [ $SECONDS -lt $deadline ]; do
+            sleep 5
+            resp=$(curl -sS -w '\n%{http_code}' -H "Authorization: Bearer $GATEWAY_TOKEN" \
+              "https://gateway.tuando.app/v1/operations/$op_id")
+            body=$(echo "$resp" | head -n -1)
+            code=$(echo "$resp" | tail -n 1)
+            # Fail fast on transport/auth errors: jq over an empty/401 body
+            # yields "null", falls through the case, and the job would spin to
+            # the deadline reporting "timed out" while the op actually succeeded.
+            if [ "$code" != "200" ]; then
+              if [ "$code" = "401" ]; then
+                echo "gateway auth failed during polling (token expired?)" >&2
+              else
+                echo "polling GET for $op_id returned HTTP $code: $body" >&2
+              fi
+              exit 1
+            fi
+            status=$(echo "$body" | jq -r '.status')
+            echo "status: $status"
+            case "$status" in
+              succeeded) exit 0 ;;
+              failed|timeout|denied)
+                echo "$body" | jq . >&2
+                exit 1 ;;
+            esac
+          done
+          echo "timed out waiting for operation $op_id" >&2
+          exit 1
