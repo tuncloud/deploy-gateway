@@ -77,7 +77,7 @@ func (d *Deps) handleRestart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !d.Policy.Authorize(id.Repository, id.RepositoryID, operation.ActionRestart, body.Namespace, body.Deployment) {
+	if !d.Policy.Authorize(id.Repository, operation.ActionRestart, body.Namespace, body.Deployment) {
 		now := time.Now().UTC()
 		if err := d.Store.PutOperation(r.Context(), &store.Operation{
 			OperationID: operation.NewOperationID(),

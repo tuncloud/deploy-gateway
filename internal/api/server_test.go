@@ -64,7 +64,6 @@ func newDeps(t *testing.T, policyYAML string, failPatch bool) (http.Handler, fun
 const testPolicy = `version: 1
 repositories:
   - repository: tuncloud/backend
-    repository_id: "123"
     permissions:
       - action: deployment.restart
         namespaces: [backend]

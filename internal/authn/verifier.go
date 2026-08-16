@@ -47,8 +47,8 @@ func (v *Verifier) Verify(ctx context.Context, rawToken string) (*GitHubIdentity
 	if err := idToken.Claims(id); err != nil {
 		return nil, fmt.Errorf("extract claims: %w", err)
 	}
-	if id.Repository == "" || id.RepositoryID == "" {
-		return nil, fmt.Errorf("missing repository claims")
+	if id.Repository == "" {
+		return nil, fmt.Errorf("missing repository claim")
 	}
 	return id, nil
 }

@@ -14,9 +14,8 @@ type Permission struct {
 }
 
 type RepositoryEntry struct {
-	Repository   string       `yaml:"repository"`
-	RepositoryID string       `yaml:"repository_id"`
-	Permissions  []Permission `yaml:"permissions"`
+	Repository  string       `yaml:"repository"`
+	Permissions []Permission `yaml:"permissions"`
 }
 
 type Policy struct {
@@ -48,9 +47,9 @@ func matchList(list []string, value string) bool {
 	return false
 }
 
-func (p *Policy) Authorize(repo, repoID, action, namespace, deployment string) bool {
+func (p *Policy) Authorize(repo, action, namespace, deployment string) bool {
 	for _, entry := range p.Repositories {
-		if entry.Repository != repo || entry.RepositoryID != repoID {
+		if entry.Repository != repo {
 			continue
 		}
 		for _, perm := range entry.Permissions {

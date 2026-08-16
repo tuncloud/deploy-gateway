@@ -11,13 +11,11 @@ import (
 const testPolicy = `version: 1
 repositories:
   - repository: tuncloud/backend
-    repository_id: "123456789"
     permissions:
       - action: deployment.restart
         namespaces: [backend]
         deployments: [backend-api, backend-worker]
   - repository: tuncloud/infra
-    repository_id: "555"
     permissions:
       - action: deployment.restart
         namespaces: ["*"]
@@ -39,49 +37,42 @@ func load(t *testing.T) *authz.Policy {
 
 func TestAuthorizeExactMatch(t *testing.T) {
 	p := load(t)
-	if !p.Authorize("tuncloud/backend", "123456789", "deployment.restart", "backend", "backend-api") {
+	if !p.Authorize("tuncloud/backend", "deployment.restart", "backend", "backend-api") {
 		t.Fatal("exact match should be allowed")
 	}
 }
 
 func TestAuthorizeDenyWrongDeployment(t *testing.T) {
 	p := load(t)
-	if p.Authorize("tuncloud/backend", "123456789", "deployment.restart", "backend", "coredns") {
+	if p.Authorize("tuncloud/backend", "deployment.restart", "backend", "coredns") {
 		t.Fatal("unknown deployment must be denied")
 	}
 }
 
 func TestAuthorizeDenyWrongNamespace(t *testing.T) {
 	p := load(t)
-	if p.Authorize("tuncloud/backend", "123456789", "deployment.restart", "kube-system", "backend-api") {
+	if p.Authorize("tuncloud/backend", "deployment.restart", "kube-system", "backend-api") {
 		t.Fatal("wrong namespace must be denied")
-	}
-}
-
-func TestAuthorizeDenyRepoIDMismatch(t *testing.T) {
-	p := load(t)
-	if p.Authorize("tuncloud/backend", "999", "deployment.restart", "backend", "backend-api") {
-		t.Fatal("repository_id mismatch must be denied (repo rename/impersonation guard)")
 	}
 }
 
 func TestAuthorizeDenyUnknownRepo(t *testing.T) {
 	p := load(t)
-	if p.Authorize("evil/repo", "123456789", "deployment.restart", "backend", "backend-api") {
+	if p.Authorize("evil/repo", "deployment.restart", "backend", "backend-api") {
 		t.Fatal("unknown repository must be denied")
 	}
 }
 
 func TestAuthorizeDenyUnknownAction(t *testing.T) {
 	p := load(t)
-	if p.Authorize("tuncloud/backend", "123456789", "deployment.delete", "backend", "backend-api") {
+	if p.Authorize("tuncloud/backend", "deployment.delete", "backend", "backend-api") {
 		t.Fatal("unknown action must be denied")
 	}
 }
 
 func TestAuthorizeWildcard(t *testing.T) {
 	p := load(t)
-	if !p.Authorize("tuncloud/infra", "555", "deployment.restart", "anything", "whatever") {
+	if !p.Authorize("tuncloud/infra", "deployment.restart", "anything", "whatever") {
 		t.Fatal("wildcard entry should allow any ns/dep")
 	}
 }
