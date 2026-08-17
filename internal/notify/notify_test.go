@@ -96,7 +96,7 @@ func TestResolvedAfterFailedSendPostsFreshMessage(t *testing.T) {
 }
 
 func TestStartedDoesNotBlockTheCaller(t *testing.T) {
-	base, _ := fakeTelegram(t, func(w http.ResponseWriter, _ recorded) {
+	base, requests := fakeTelegram(t, func(w http.ResponseWriter, _ recorded) {
 		time.Sleep(300 * time.Millisecond)
 		w.Write([]byte(`{"ok":true,"result":{"message_id":903}}`))
 	})
@@ -107,6 +107,11 @@ func TestStartedDoesNotBlockTheCaller(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
 		t.Fatalf("Started blocked for %v; sends must be asynchronous", elapsed)
 	}
+
+	// Drain the in-flight send before the fake server is torn down (via
+	// t.Cleanup), so the background goroutine settles inside this test's
+	// window instead of racing the next test's fake server shutdown.
+	waitFor(t, 2*time.Second, func() bool { return len(requests()) == 1 })
 }
 
 func TestDisabledPerformsNoRequests(t *testing.T) {
