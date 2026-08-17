@@ -1,0 +1,37 @@
+name: CD
+
+on:
+  workflow_dispatch:
+    inputs:
+      namespace:
+        description: Namespace
+        required: true
+        type: string
+        default: platform-system
+      deployment:
+        description: Deployment
+        required: true
+        type: string
+        default: deploy-gateway
+      image:
+        description: Full image reference, e.g. docker.io/tuncloud/api:v1.4.2
+        required: true
+        type: string
+        default: ghcr.io/tuncloud/deploy-gateway:v0.7.0
+      container:
+        description: Container to update (leave empty for single-container pods)
+        required: false
+        type: string
+        default: 'gateway'
+
+jobs:
+  rollout:
+    uses: tuncloud/workflow/.github/workflows/rollout-deployment.yml@main
+    permissions:
+      id-token: write
+      contents: read
+    with:
+      namespace: ${{ inputs.namespace }}
+      deployment: ${{ inputs.deployment }}
+      image: ${{ inputs.image }}
+      container: ${{ inputs.container }}
