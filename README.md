@@ -25,9 +25,9 @@ Issuer `https://token.actions.githubusercontent.com`, audience
 - `container` (optional): target container name. Omitted, the gateway uses the
   pod's only container; if the pod spec has more than one, the request fails
   `400 AMBIGUOUS_CONTAINER` and `container` must be set explicitly.
-- Rolling the same image again is a no-op rollout: the patch doesn't change the
-  pod template, no new generation is created, and the operation resolves as
-  succeeded against the current generation.
+- Rolling the same image again still rolls: the patch also stamps
+  `kubectl.kubernetes.io/restartedAt`, so the pod template always changes and
+  pods are always replaced — required for mutable tags (`:latest`, `:staging`).
 
 ## Usage from a repository
 
@@ -57,6 +57,50 @@ The repository must be listed in the gateway policy ConfigMap
 (`deploy-gateway-policy`, namespace `platform-system`); after editing it, run
 `kubectl -n platform-system rollout restart deploy/deploy-gateway`.
 
+## Notifications
+
+Set both variables to post a Telegram message per deploy. Unset, notifications
+are disabled and the gateway logs `telegram notifications disabled` at startup.
+
+| Variable | Purpose |
+|---|---|
+| `TELEGRAM_BOT_TOKEN` | bot token, from a Secret |
+| `TELEGRAM_CHAT_ID` | destination chat (e.g. `-1001234567890`) |
+| `TELEGRAM_API_BASE` | override the API host; defaults to `https://api.telegram.org` |
+
+```bash
+kubectl -n platform-system create secret generic deploy-gateway-telegram \
+  --from-literal=bot-token='123456:ABC-DEF...'
+```
+
+```yaml
+env:
+  - name: TELEGRAM_BOT_TOKEN
+    valueFrom:
+      secretKeyRef:
+        name: deploy-gateway-telegram
+        key: bot-token
+  - name: TELEGRAM_CHAT_ID
+    value: "-1001234567890"
+```
+
+One message is posted when a deploy starts and edited in place when it
+resolves:
+
+```
+🟡 rollout · backend/backend-api      →   ✅ rollout · backend/backend-api
+ghcr.io/org/api:v2.1.0                    ghcr.io/org/api:v2.1.0
+@octocat · run #4711                      @octocat · run #4711
+                                          42s · op_01hxyzabc
+```
+
+Delivery is best-effort: sends are retried up to three times on rate limits and
+5xx, and a notification that never lands is logged and dropped. It never
+changes an operation's status or an API response — the audit table remains the
+source of truth. Operations resolved by the reconciler or after a gateway
+restart post a fresh terminal message instead of editing. Policy denials are
+not notified.
+
 ## Development
 
 ```
@@ -72,3 +116,5 @@ podman build -t deploy-gateway:dev .
 - Kubernetes RBAC: get/list/watch/patch on deployments only.
 - `deployment.rollout` controls which images run — grant it more narrowly than
   `deployment.restart` (a restart can't change code, a rollout can).
+- The Telegram bot token is never logged: it sits in the API request path, so
+  request URLs and transport errors are never surfaced.
