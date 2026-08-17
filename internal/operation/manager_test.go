@@ -16,6 +16,7 @@ import (
 	"github.com/tuncloud/deploy-gateway/internal/authn"
 	"github.com/tuncloud/deploy-gateway/internal/kube"
 	"github.com/tuncloud/deploy-gateway/internal/kubetest"
+	"github.com/tuncloud/deploy-gateway/internal/notify"
 	"github.com/tuncloud/deploy-gateway/internal/operation"
 	"github.com/tuncloud/deploy-gateway/internal/store"
 )
@@ -35,7 +36,7 @@ func setup(t *testing.T) (*operation.Manager, store.Store, kubernetes.Interface)
 		t.Fatal(err)
 	}
 	st := store.NewInMemory()
-	m := operation.NewManager(k, st, slog.Default(), 30*time.Second)
+	m := operation.NewManager(k, st, notify.Disabled(), slog.Default(), 30*time.Second)
 	return m, st, cs
 }
 
@@ -266,7 +267,7 @@ var errFakeRollout = errors.New("fake rollout failure")
 
 func newRolloutManager(k kube.Kube) (*operation.Manager, store.Store) {
 	st := store.NewInMemory()
-	return operation.NewManager(k, st, slog.Default(), time.Minute), st
+	return operation.NewManager(k, st, notify.Disabled(), slog.Default(), time.Minute), st
 }
 
 func TestRolloutHappyPathRecordsImageAndContainer(t *testing.T) {

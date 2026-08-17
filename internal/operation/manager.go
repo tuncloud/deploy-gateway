@@ -14,6 +14,7 @@ import (
 
 	"github.com/tuncloud/deploy-gateway/internal/authn"
 	"github.com/tuncloud/deploy-gateway/internal/kube"
+	"github.com/tuncloud/deploy-gateway/internal/notify"
 	"github.com/tuncloud/deploy-gateway/internal/store"
 )
 
@@ -27,15 +28,19 @@ var ErrAmbiguousContainer = errors.New("deployment has multiple containers; cont
 type Manager struct {
 	kube            kube.Kube
 	store           store.Store
+	notify          notify.Notifier
 	log             *slog.Logger
 	defaultDeadline time.Duration
 }
 
-func NewManager(k kube.Kube, st store.Store, log *slog.Logger, defaultDeadline time.Duration) *Manager {
+func NewManager(k kube.Kube, st store.Store, n notify.Notifier, log *slog.Logger, defaultDeadline time.Duration) *Manager {
 	if defaultDeadline <= 0 {
 		defaultDeadline = 10 * time.Minute
 	}
-	return &Manager{kube: k, store: st, log: log, defaultDeadline: defaultDeadline}
+	if n == nil {
+		n = notify.Disabled()
+	}
+	return &Manager{kube: k, store: st, notify: n, log: log, defaultDeadline: defaultDeadline}
 }
 
 func NewOperationID() string {
@@ -69,7 +74,7 @@ func (m *Manager) Restart(ctx context.Context, id *authn.GitHubIdentity, namespa
 	}
 
 	if err := m.kube.RestartDeployment(ctx, namespace, deployment); err != nil {
-		m.failOperation(op.OperationID, "K8S_PATCH_FAILED", err.Error())
+		m.failOperation(op, nil, "K8S_PATCH_FAILED", err.Error())
 		return op.OperationID, fmt.Errorf("patch deployment: %w", err)
 	}
 
@@ -77,7 +82,8 @@ func (m *Manager) Restart(ctx context.Context, id *authn.GitHubIdentity, namespa
 		"operation_id", op.OperationID, "repository", id.Repository,
 		"namespace", namespace, "deployment", deployment, "run_id", id.RunID)
 
-	go m.watchRollout(op)
+	msg := m.notify.Started(op)
+	go m.watchRollout(op, msg)
 	return op.OperationID, nil
 }
 
@@ -123,7 +129,7 @@ func (m *Manager) Rollout(ctx context.Context, id *authn.GitHubIdentity, namespa
 	}
 
 	if err := m.kube.RolloutDeployment(ctx, namespace, deployment, container, image); err != nil {
-		m.failOperation(op.OperationID, "K8S_PATCH_FAILED", err.Error())
+		m.failOperation(op, nil, "K8S_PATCH_FAILED", err.Error())
 		return op.OperationID, fmt.Errorf("patch deployment: %w", err)
 	}
 
@@ -132,7 +138,8 @@ func (m *Manager) Rollout(ctx context.Context, id *authn.GitHubIdentity, namespa
 		"namespace", namespace, "deployment", deployment,
 		"container", container, "image", image, "run_id", id.RunID)
 
-	go m.watchRollout(op)
+	msg := m.notify.Started(op)
+	go m.watchRollout(op, msg)
 	return op.OperationID, nil
 }
 
@@ -184,17 +191,39 @@ func (m *Manager) recordFailedRollout(ctx context.Context, id *authn.GitHubIdent
 		m.log.Error("persist failed rollout operation", "err", err)
 		return ""
 	}
-	m.failOperation(op.OperationID, code, msg)
+	m.failOperation(op, nil, code, msg)
 	return op.OperationID
 }
 
-func (m *Manager) failOperation(opID, code, msg string) {
-	if err := m.store.UpdateTerminal(context.Background(), opID, store.TerminalUpdate{
-		Status: store.StatusFailed, Event: "FAILED",
-		ErrorCode: code, ErrorMessage: msg, CompletedAt: time.Now().UTC(),
-	}); err != nil {
-		m.logTerminalWriteErr("mark operation failed", opID, err)
+// applyTerminal returns a copy of op with the terminal update applied, so a
+// notification renders final status, error and elapsed time without re-reading
+// the store.
+func applyTerminal(op *store.Operation, upd store.TerminalUpdate) *store.Operation {
+	cp := *op
+	cp.Status = upd.Status
+	cp.ErrorCode = upd.ErrorCode
+	cp.ErrorMessage = upd.ErrorMessage
+	completed := upd.CompletedAt
+	cp.CompletedAt = &completed
+	return &cp
+}
+
+// resolve performs the single terminal write and notifies only when this
+// writer won: UpdateTerminal returns ErrAlreadyTerminal to everyone else, so
+// exactly one of watcher, sweeper or lazy GET sends the message.
+func (m *Manager) resolve(op *store.Operation, msg *notify.Message, what string, upd store.TerminalUpdate) {
+	if err := m.store.UpdateTerminal(context.Background(), op.OperationID, upd); err != nil {
+		m.logTerminalWriteErr(what, op.OperationID, err)
+		return
 	}
+	m.notify.Resolved(applyTerminal(op, upd), msg)
+}
+
+func (m *Manager) failOperation(op *store.Operation, msg *notify.Message, code, errMsg string) {
+	m.resolve(op, msg, "mark operation failed", store.TerminalUpdate{
+		Status: store.StatusFailed, Event: "FAILED",
+		ErrorCode: code, ErrorMessage: errMsg, CompletedAt: time.Now().UTC(),
+	})
 }
 
 // logTerminalWriteErr: ErrAlreadyTerminal means another writer (watcher vs
@@ -216,7 +245,7 @@ func (m *Manager) progressDeadline(dep *appsv1.Deployment) time.Duration {
 
 // watchRollout follows the deployment until terminal state. Watch channel close,
 // 410 Gone, or transport errors are NOT failures: re-get, evaluate, re-watch.
-func (m *Manager) watchRollout(op *store.Operation) {
+func (m *Manager) watchRollout(op *store.Operation, msg *notify.Message) {
 	ctx := context.Background()
 
 	var deadline time.Duration
@@ -232,11 +261,11 @@ func (m *Manager) watchRollout(op *store.Operation) {
 	const maxBackoff = 15 * time.Second
 	for {
 		if ctx.Err() != nil {
-			m.timeoutOperation(op.OperationID, "watch deadline exceeded before rollout resolved")
+			m.timeoutOperation(op, msg, "watch deadline exceeded before rollout resolved")
 			return
 		}
 
-		if m.evalOnce(ctx, op) {
+		if m.evalOnce(ctx, op, msg) {
 			return
 		}
 
@@ -244,7 +273,7 @@ func (m *Manager) watchRollout(op *store.Operation) {
 		if err != nil {
 			m.log.Warn("watch start failed", "operation_id", op.OperationID, "err", err)
 			if !sleepCtx(ctx, backoff) {
-				m.timeoutOperation(op.OperationID, "watch deadline exceeded")
+				m.timeoutOperation(op, msg, "watch deadline exceeded")
 				return
 			}
 			backoff = min(2*backoff, maxBackoff)
@@ -258,19 +287,19 @@ func (m *Manager) watchRollout(op *store.Operation) {
 			}
 			ev := kube.EvaluateRollout(dep)
 			if ev.State == kube.RolloutComplete {
-				m.completeOperation(op.OperationID, ev.Reason)
+				m.completeOperation(op, msg, ev.Reason)
 				w.Stop()
 				return
 			}
 			if ev.State == kube.RolloutFailed {
-				m.failOperation(op.OperationID, "ROLLOUT_FAILED", ev.Reason)
+				m.failOperation(op, msg, "ROLLOUT_FAILED", ev.Reason)
 				w.Stop()
 				return
 			}
 		}
 		// channel closed — re-list, re-evaluate, restart watch
 		if !sleepCtx(ctx, backoff) {
-			m.timeoutOperation(op.OperationID, "watch deadline exceeded after reconnect")
+			m.timeoutOperation(op, msg, "watch deadline exceeded after reconnect")
 			return
 		}
 		backoff = min(2*backoff, maxBackoff)
@@ -279,7 +308,7 @@ func (m *Manager) watchRollout(op *store.Operation) {
 
 // evalOnce re-reads the deployment and resolves the operation if already
 // terminal. Returns true when the operation was resolved.
-func (m *Manager) evalOnce(ctx context.Context, op *store.Operation) bool {
+func (m *Manager) evalOnce(ctx context.Context, op *store.Operation, msg *notify.Message) bool {
 	dep, err := m.kube.GetDeployment(ctx, op.Namespace, op.Deployment)
 	if err != nil {
 		m.log.Warn("re-get deployment", "operation_id", op.OperationID, "err", err)
@@ -288,31 +317,27 @@ func (m *Manager) evalOnce(ctx context.Context, op *store.Operation) bool {
 	ev := kube.EvaluateRollout(dep)
 	switch ev.State {
 	case kube.RolloutComplete:
-		m.completeOperation(op.OperationID, ev.Reason)
+		m.completeOperation(op, msg, ev.Reason)
 		return true
 	case kube.RolloutFailed:
-		m.failOperation(op.OperationID, "ROLLOUT_FAILED", ev.Reason)
+		m.failOperation(op, msg, "ROLLOUT_FAILED", ev.Reason)
 		return true
 	}
 	return false
 }
 
-func (m *Manager) completeOperation(opID, reason string) {
-	if err := m.store.UpdateTerminal(context.Background(), opID, store.TerminalUpdate{
+func (m *Manager) completeOperation(op *store.Operation, msg *notify.Message, reason string) {
+	m.resolve(op, msg, "mark operation succeeded", store.TerminalUpdate{
 		Status: store.StatusSucceeded, Event: "SUCCEEDED", CompletedAt: time.Now().UTC(),
-	}); err != nil {
-		m.logTerminalWriteErr("mark operation succeeded", opID, err)
-	}
-	m.log.Info("rollout succeeded", "operation_id", opID, "reason", reason)
+	})
+	m.log.Info("rollout succeeded", "operation_id", op.OperationID, "reason", reason)
 }
 
-func (m *Manager) timeoutOperation(opID, msg string) {
-	if err := m.store.UpdateTerminal(context.Background(), opID, store.TerminalUpdate{
+func (m *Manager) timeoutOperation(op *store.Operation, msg *notify.Message, errMsg string) {
+	m.resolve(op, msg, "mark operation timeout", store.TerminalUpdate{
 		Status: store.StatusTimeout, Event: "TIMEOUT",
-		ErrorCode: "TIMEOUT", ErrorMessage: msg, CompletedAt: time.Now().UTC(),
-	}); err != nil {
-		m.logTerminalWriteErr("mark operation timeout", opID, err)
-	}
+		ErrorCode: "TIMEOUT", ErrorMessage: errMsg, CompletedAt: time.Now().UTC(),
+	})
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) bool {
