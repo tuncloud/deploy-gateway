@@ -207,6 +207,9 @@ func (f *completingKube) GetDeployment(context.Context, string, string) (*appsv1
 			Spec: corev1.PodSpec{Containers: f.containers},
 		}},
 		Status: appsv1.DeploymentStatus{
+			// Replicas == desired is part of "complete": it says no pod from an
+			// older ReplicaSet is left, so the ready pod is the new one.
+			Replicas:          1,
 			UpdatedReplicas:   1,
 			ReadyReplicas:     1,
 			AvailableReplicas: 1,
