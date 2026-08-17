@@ -92,8 +92,8 @@ func TestRolloutUpdatesImageSingleContainer(t *testing.T) {
 	if got := after.Spec.Template.Spec.Containers[0].Image; got != "busybox:2" {
 		t.Fatalf("image = %q, want busybox:2", got)
 	}
-	if _, ok := after.Spec.Template.Annotations["kubectl.kubernetes.io/restartedAt"]; ok {
-		t.Fatal("rollout must not set restartedAt")
+	if _, ok := after.Spec.Template.Annotations["kubectl.kubernetes.io/restartedAt"]; !ok {
+		t.Fatal("rollout must set restartedAt so the pod template always changes")
 	}
 }
 
@@ -195,4 +195,47 @@ func TestWatchDeploymentReceivesEvents(t *testing.T) {
 		}
 	}
 	t.Fatal("no expected watch event before channel close/timeout")
+}
+
+func TestRolloutSameImageStillRollsDeployment(t *testing.T) {
+	cfg, cs := kubetest.Start(t)
+	ctx := context.Background()
+	ns := "same-tag-ns"
+	if _, err := cs.CoreV1().Namespaces().Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cs.AppsV1().Deployments(ns).Create(ctx, makeDeployment("api", ns), metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	k, err := kube.NewFromConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := k.RolloutDeployment(ctx, ns, "api", "c", "busybox:7"); err != nil {
+		t.Fatal(err)
+	}
+	first, err := cs.AppsV1().Deployments(ns).Get(ctx, "api", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Same image again: the tag did not move, but the deployment must still roll.
+	if err := k.RolloutDeployment(ctx, ns, "api", "c", "busybox:7"); err != nil {
+		t.Fatal(err)
+	}
+	second, err := cs.AppsV1().Deployments(ns).Get(ctx, "api", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if second.Generation <= first.Generation {
+		t.Fatalf("generation = %d, want > %d (same-tag rollout must still roll)",
+			second.Generation, first.Generation)
+	}
+	const key = "kubectl.kubernetes.io/restartedAt"
+	if first.Spec.Template.Annotations[key] == second.Spec.Template.Annotations[key] {
+		t.Fatalf("restartedAt unchanged (%q): pod template hash would be identical",
+			second.Spec.Template.Annotations[key])
+	}
 }
