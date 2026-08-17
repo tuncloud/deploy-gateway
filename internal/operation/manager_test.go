@@ -84,6 +84,74 @@ func TestRestartHappyPathSucceeds(t *testing.T) {
 	})
 }
 
+// A single-replica rollout surges: maxUnavailable rounds to 0 and maxSurge to
+// 1, so the controller creates the new pod while the old one keeps serving.
+// updated/ready/available all read 1 in that window, but the ready pod is the
+// old one. The operation must stay running until the old pod is gone —
+// resolving here would report success for an image that never served traffic.
+func TestRolloutStaysRunningWhileOldPodStillServes(t *testing.T) {
+	ctx := context.Background()
+	m, st, cs := setup(t)
+	ns := "surge"
+	cs.CoreV1().Namespaces().Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}, metav1.CreateOptions{})
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "api", Namespace: ns, Generation: 1},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: ptr32(1),
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "api"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "api"}},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "busybox"}}},
+			},
+		},
+	}
+	if _, err := cs.AppsV1().Deployments(ns).Create(ctx, dep, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	opID, err := m.Rollout(ctx, identity(), ns, "api", "c", "busybox:2")
+	if err != nil {
+		t.Fatalf("rollout: %v", err)
+	}
+
+	// Mid-surge: the new pod exists (updated=1) but the ready and available pod
+	// is still the old one, so two pods are counted.
+	got, _ := cs.AppsV1().Deployments(ns).Get(ctx, "api", metav1.GetOptions{})
+	got.Status.ObservedGeneration = got.Generation
+	got.Status.Replicas = 2
+	got.Status.UpdatedReplicas = 1
+	got.Status.ReadyReplicas = 1
+	got.Status.AvailableReplicas = 1
+	if _, err := cs.AppsV1().Deployments(ns).UpdateStatus(ctx, got, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Give the watcher time to act on that status before asserting it did not.
+	time.Sleep(500 * time.Millisecond)
+	op, err := st.GetOperation(ctx, opID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if op.Status != store.StatusRunning {
+		t.Fatalf("operation resolved as %s mid-surge; the new pod was not ready yet", op.Status)
+	}
+
+	// Old pod gone, only the new one remains.
+	got, _ = cs.AppsV1().Deployments(ns).Get(ctx, "api", metav1.GetOptions{})
+	got.Status.Replicas = 1
+	got.Status.UpdatedReplicas = 1
+	got.Status.ReadyReplicas = 1
+	got.Status.AvailableReplicas = 1
+	if _, err := cs.AppsV1().Deployments(ns).UpdateStatus(ctx, got, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, 10*time.Second, func() bool {
+		op, err := st.GetOperation(ctx, opID)
+		return err == nil && op.Status == store.StatusSucceeded
+	})
+}
+
 func TestRestartPatchFailureMarksFailed(t *testing.T) {
 	ctx := context.Background()
 	m, st, _ := setup(t)

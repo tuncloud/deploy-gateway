@@ -28,6 +28,10 @@ Issuer `https://token.actions.githubusercontent.com`, audience
 - Rolling the same image again still rolls: the patch also stamps
   `kubectl.kubernetes.io/restartedAt`, so the pod template always changes and
   pods are always replaced — required for mutable tags (`:latest`, `:staging`).
+- An operation reports `succeeded` only once every running pod is a new pod that
+  is ready and available, and no pod from the previous ReplicaSet is left —
+  the same bar as `kubectl rollout status`. Old pods finishing their termination
+  grace period therefore keep the operation `running` for a few more seconds.
 - A same-tag rollout now consumes the caller's workflow timeout budget:
   workflows that previously got an instant green check from re-pushing a
   mutable tag will now wait for a real rollout, so `timeout-seconds` in the
