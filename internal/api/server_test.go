@@ -22,6 +22,7 @@ import (
 	"github.com/tuncloud/deploy-gateway/internal/authn"
 	"github.com/tuncloud/deploy-gateway/internal/authz"
 	"github.com/tuncloud/deploy-gateway/internal/kube"
+	"github.com/tuncloud/deploy-gateway/internal/notify"
 	"github.com/tuncloud/deploy-gateway/internal/operation"
 	"github.com/tuncloud/deploy-gateway/internal/store"
 )
@@ -69,7 +70,7 @@ func newDepsK(t *testing.T, policyYAML string, k kube.Kube) (http.Handler, func(
 		t.Fatal(err)
 	}
 	st := store.NewRecording() // wraps NewInMemory, records PutOperation calls
-	m := operation.NewManager(k, st, slog.Default(), time.Minute)
+	m := operation.NewManager(k, st, notify.Disabled(), slog.Default(), time.Minute)
 	// Static verifier accepts any token; real signature checks are covered by
 	// the authn tests (Task 3).
 	v := authn.NewStaticVerifier(&authn.GitHubIdentity{
@@ -343,7 +344,7 @@ func newDepsCustom(t *testing.T, v api.TokenVerifier, st store.Store, log *slog.
 	if err != nil {
 		t.Fatal(err)
 	}
-	m := operation.NewManager(&fakeKube{}, st, log, time.Minute)
+	m := operation.NewManager(&fakeKube{}, st, notify.Disabled(), log, time.Minute)
 	return api.NewRouter(api.Deps{Verifier: v, Policy: pol, Ops: m, Store: st, Log: log})
 }
 

@@ -10,6 +10,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/watch"
 
+	"github.com/tuncloud/deploy-gateway/internal/notify"
 	"github.com/tuncloud/deploy-gateway/internal/operation"
 	"github.com/tuncloud/deploy-gateway/internal/store"
 )
@@ -45,7 +46,7 @@ func staleRunningOp() *store.Operation {
 func TestResolveRunningCanceledContextLeavesOpRunning(t *testing.T) {
 	ctx := context.Background()
 	st := store.NewInMemory()
-	m := operation.NewManager(&getErrKube{getErr: context.Canceled}, st, slog.Default(), time.Minute)
+	m := operation.NewManager(&getErrKube{getErr: context.Canceled}, st, notify.Disabled(), slog.Default(), time.Minute)
 	st.PutOperation(ctx, staleRunningOp())
 
 	op, err := m.Get(ctx, "op_cancel")
@@ -62,7 +63,7 @@ func TestReconcileSweepCanceledContextLeavesOpRunning(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	st := store.NewInMemory()
-	m := operation.NewManager(&getErrKube{getErr: context.Canceled}, st, slog.Default(), time.Minute)
+	m := operation.NewManager(&getErrKube{getErr: context.Canceled}, st, notify.Disabled(), slog.Default(), time.Minute)
 	st.PutOperation(context.Background(), staleRunningOp())
 
 	m.ReconcileSweep(ctx)
@@ -77,7 +78,7 @@ func TestReconcileSweepCanceledContextLeavesOpRunning(t *testing.T) {
 func TestResolveRunningRealErrorStillTimesOut(t *testing.T) {
 	ctx := context.Background()
 	st := store.NewInMemory()
-	m := operation.NewManager(&getErrKube{getErr: errors.New("connection refused")}, st, slog.Default(), time.Minute)
+	m := operation.NewManager(&getErrKube{getErr: errors.New("connection refused")}, st, notify.Disabled(), slog.Default(), time.Minute)
 	st.PutOperation(ctx, staleRunningOp())
 
 	m.ReconcileSweep(ctx)

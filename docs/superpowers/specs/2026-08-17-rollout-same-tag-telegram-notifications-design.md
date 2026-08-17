@@ -182,6 +182,7 @@ silently, as the existing code already does for logging.
 |---|---|
 | Normal rollout or restart | started, edited to terminal |
 | Patch fails before watch | one terminal (failure) message, no started |
+| Container resolution fails (rollout only) | one terminal (failure) message, no started — `recordFailedRollout` → `failOperation` |
 | Resolved by sweeper or lazy GET | started, then a **fresh** terminal message (no handle in memory) |
 | Resolved after gateway restart | fresh terminal message only |
 | Policy denied | none (non-goal) |

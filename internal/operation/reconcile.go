@@ -54,16 +54,16 @@ func (m *Manager) resolveRunning(ctx context.Context, op *store.Operation) {
 				"operation_id", op.OperationID, "err", err)
 			return
 		}
-		m.timeoutOperation(op.OperationID, "deployment no longer readable while operation running: "+err.Error())
+		m.timeoutOperation(op, nil, "deployment no longer readable while operation running: "+err.Error())
 		return
 	}
 	ev := kube.EvaluateRollout(dep)
 	switch ev.State {
 	case kube.RolloutComplete:
-		m.completeOperation(op.OperationID, ev.Reason)
+		m.completeOperation(op, nil, ev.Reason)
 	case kube.RolloutFailed:
-		m.failOperation(op.OperationID, "ROLLOUT_FAILED", ev.Reason)
+		m.failOperation(op, nil, "ROLLOUT_FAILED", ev.Reason)
 	default:
-		m.timeoutOperation(op.OperationID, "operation stale and rollout still not terminal: "+ev.Reason)
+		m.timeoutOperation(op, nil, "operation stale and rollout still not terminal: "+ev.Reason)
 	}
 }

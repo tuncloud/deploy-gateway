@@ -45,6 +45,14 @@ func NewInCluster() (Kube, error) {
 	return NewFromConfig(cfg)
 }
 
+// restartStamp is the annotation value that forces a pod-template change.
+// Nanosecond precision matters: at second resolution two operations inside the
+// same second produce an identical template, no new generation, and a rollout
+// that silently does nothing.
+func restartStamp() string {
+	return time.Now().UTC().Format(time.RFC3339Nano)
+}
+
 // RestartDeployment performs a kubectl-rollout-restart equivalent patch on the
 // deployment's pod template. The timestamp is server-visible and only serves to
 // change the template hash; RetryOnConflict guards against resourceVersion
@@ -53,7 +61,7 @@ func (c *client) RestartDeployment(ctx context.Context, namespace, name string) 
 	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		patch := fmt.Sprintf(
 			`{"spec":{"template":{"metadata":{"annotations":{"kubectl.kubernetes.io/restartedAt":%q}}}}}`,
-			time.Now().UTC().Format(time.RFC3339),
+			restartStamp(),
 		)
 		_, err := c.deployments(namespace).Patch(
 			ctx, name, types.StrategicMergePatchType, []byte(patch), metav1.PatchOptions{})
@@ -62,16 +70,20 @@ func (c *client) RestartDeployment(ctx context.Context, namespace, name string) 
 }
 
 // RolloutDeployment sets a container's image via strategic merge patch
-// (containers merge by name, so other containers and fields are untouched).
-// No restartedAt annotation: the template change alone rolls the deployment.
+// (containers merge by name, so other containers and fields are untouched) and
+// stamps the same restartedAt annotation restart uses. The annotation is what
+// makes a rollout to an unchanged tag still roll: without it the pod template
+// is identical, no generation is created, and the operation would resolve as
+// succeeded against pre-patch state without replacing a pod.
 func (c *client) RolloutDeployment(ctx context.Context, namespace, name, container, image string) error {
 	if container == "" || image == "" {
 		return fmt.Errorf("rollout requires container and image")
 	}
 	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		patch := fmt.Sprintf(
-			`{"spec":{"template":{"spec":{"containers":[{"name":%q,"image":%q}]}}}}`,
-			container, image,
+			`{"spec":{"template":{"metadata":{"annotations":{"kubectl.kubernetes.io/restartedAt":%q}},`+
+				`"spec":{"containers":[{"name":%q,"image":%q}]}}}}`,
+			restartStamp(), container, image,
 		)
 		_, err := c.deployments(namespace).Patch(
 			ctx, name, types.StrategicMergePatchType, []byte(patch), metav1.PatchOptions{})

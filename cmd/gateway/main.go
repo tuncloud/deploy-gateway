@@ -13,6 +13,7 @@ import (
 	"github.com/tuncloud/deploy-gateway/internal/authn"
 	"github.com/tuncloud/deploy-gateway/internal/authz"
 	"github.com/tuncloud/deploy-gateway/internal/kube"
+	"github.com/tuncloud/deploy-gateway/internal/notify"
 	"github.com/tuncloud/deploy-gateway/internal/operation"
 	"github.com/tuncloud/deploy-gateway/internal/store"
 )
@@ -59,7 +60,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	ops := operation.NewManager(k, st, logger, 10*time.Minute)
+	notifier := notify.New(notify.Config{
+		BotToken: os.Getenv("TELEGRAM_BOT_TOKEN"),
+		ChatID:   os.Getenv("TELEGRAM_CHAT_ID"),
+		APIBase:  os.Getenv("TELEGRAM_API_BASE"),
+	}, logger)
+
+	ops := operation.NewManager(k, st, notifier, logger, 10*time.Minute)
 	go ops.StartSweeper(ctx)
 
 	srv := &http.Server{
