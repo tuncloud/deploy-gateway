@@ -10,7 +10,14 @@ import (
 
 // handleWait bounds how long a terminal notification waits for the started
 // message's id before giving up and posting a fresh message instead.
-const handleWait = 10 * time.Second
+//
+// handleWait must exceed callTimeout: a start send may retry for the whole
+// call budget, and a terminal notification that gave up waiting would post a
+// fresh message that the late start message then lands *after* — a running
+// marker in the chat for a deploy that already finished, with nothing left to
+// edit it. Waiting a beat longer than the send can possibly take removes the
+// inversion by construction.
+var handleWait = callTimeout + time.Second
 
 // Notifier turns operations into chat messages. Every method is best-effort
 // and non-blocking: delivery never affects an operation's outcome, and no

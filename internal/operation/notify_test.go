@@ -7,32 +7,57 @@ import (
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/watch"
 
 	"github.com/tuncloud/deploy-gateway/internal/notify"
 	"github.com/tuncloud/deploy-gateway/internal/operation"
 	"github.com/tuncloud/deploy-gateway/internal/store"
 )
 
-// fakeNotifier records what the manager announced. It returns a nil handle,
-// which the real Message type accepts everywhere.
+// fakeNotifier records what the manager announced, and the *notify.Message
+// handles it hands out and receives back, so tests can assert the manager
+// threads the same handle from Started through to Resolved rather than
+// discarding it (which would silently double the messages per deploy).
 type fakeNotifier struct {
-	mu       sync.Mutex
-	started  []*store.Operation
-	resolved []*store.Operation
+	mu              sync.Mutex
+	started         []*store.Operation
+	resolved        []*store.Operation
+	startedHandles  []*notify.Message
+	resolvedHandles []*notify.Message
 }
 
 func (f *fakeNotifier) Started(op *store.Operation) *notify.Message {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.started = append(f.started, op)
-	return nil
+	// A sentinel handle, not nil: this is legal because we never call wait()
+	// on it, so a zero-value (nil) ready channel is harmless.
+	msg := &notify.Message{}
+	f.startedHandles = append(f.startedHandles, msg)
+	return msg
 }
 
-func (f *fakeNotifier) Resolved(op *store.Operation, _ *notify.Message) {
+func (f *fakeNotifier) Resolved(op *store.Operation, msg *notify.Message) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.resolved = append(f.resolved, op)
+	f.resolvedHandles = append(f.resolvedHandles, msg)
+}
+
+// handles returns the most recently handed-out Started handle and the most
+// recently received Resolved handle.
+func (f *fakeNotifier) handles() (started, resolved *notify.Message) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.startedHandles) > 0 {
+		started = f.startedHandles[len(f.startedHandles)-1]
+	}
+	if len(f.resolvedHandles) > 0 {
+		resolved = f.resolvedHandles[len(f.resolvedHandles)-1]
+	}
+	return started, resolved
 }
 
 func (f *fakeNotifier) counts() (int, int) {
@@ -162,5 +187,62 @@ func TestUndeliverableNotificationsDoNotAffectTheOperation(t *testing.T) {
 	}
 	if op.Status != store.StatusFailed || op.ErrorCode != "K8S_PATCH_FAILED" {
 		t.Fatalf("op = %s/%s, want failed/K8S_PATCH_FAILED", op.Status, op.ErrorCode)
+	}
+}
+
+// completingKube reports the rollout as already complete on the very first
+// GetDeployment call, so watchRollout resolves the operation in evalOnce
+// without ever needing to start a watch.
+type completingKube struct {
+	containers []corev1.Container
+}
+
+func (f *completingKube) RestartDeployment(context.Context, string, string) error { return nil }
+func (f *completingKube) RolloutDeployment(context.Context, string, string, string, string) error {
+	return nil
+}
+func (f *completingKube) GetDeployment(context.Context, string, string) (*appsv1.Deployment, error) {
+	return &appsv1.Deployment{
+		Spec: appsv1.DeploymentSpec{Template: corev1.PodTemplateSpec{
+			Spec: corev1.PodSpec{Containers: f.containers},
+		}},
+		Status: appsv1.DeploymentStatus{
+			UpdatedReplicas:   1,
+			ReadyReplicas:     1,
+			AvailableReplicas: 1,
+		},
+	}, nil
+}
+func (f *completingKube) WatchDeployment(context.Context, string, string) (watch.Interface, error) {
+	return watch.NewFake(), nil
+}
+
+// TestResolvedReceivesTheHandleStartedReturned is the regression test for the
+// manager silently degrading "one message, edited in place" into "two
+// messages per deploy": it is the pointer identity of the *notify.Message
+// handle — not just the notification counts — that proves watchRollout
+// threaded the handle Started returned through to Resolved instead of
+// dropping it (e.g. by passing nil).
+func TestResolvedReceivesTheHandleStartedReturned(t *testing.T) {
+	ctx := context.Background()
+	fk := &completingKube{containers: []corev1.Container{{Name: "app"}}}
+	fn := &fakeNotifier{}
+	m := operation.NewManager(fk, store.NewInMemory(), fn, slog.Default(), time.Minute)
+
+	if _, err := m.Rollout(ctx, identity(), "ns", "api", "", "img:v2"); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, 2*time.Second, func() bool {
+		_, resolved := fn.counts()
+		return resolved == 1
+	})
+
+	started, resolved := fn.handles()
+	if started == nil {
+		t.Fatal("Started must hand out a non-nil handle")
+	}
+	if started != resolved {
+		t.Fatalf("Resolved handle = %p, want the identical handle Started returned (%p)", resolved, started)
 	}
 }

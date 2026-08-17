@@ -63,7 +63,7 @@ func main() {
 	notifier := notify.New(notify.Config{
 		BotToken: os.Getenv("TELEGRAM_BOT_TOKEN"),
 		ChatID:   os.Getenv("TELEGRAM_CHAT_ID"),
-		APIBase:  envOr("TELEGRAM_API_BASE", "https://api.telegram.org"),
+		APIBase:  os.Getenv("TELEGRAM_API_BASE"),
 	}, logger)
 
 	ops := operation.NewManager(k, st, notifier, logger, 10*time.Minute)

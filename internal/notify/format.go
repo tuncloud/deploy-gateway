@@ -10,6 +10,14 @@ import (
 // esc escapes only the three characters Telegram's HTML parse mode reserves.
 // html.EscapeString is deliberately not used: it emits numeric entities for
 // quotes, which Telegram renders literally.
+//
+// esc is written for text content, but runLink below also interpolates its
+// result into an href attribute, where an unescaped quote could break out of
+// the attribute. That is safe today only because every value that reaches an
+// href — the repository and run id — comes from the verified GitHub OIDC
+// token; esc must not start escaping quotes for the text-content callers'
+// sake, but a future link built from a less-trusted field would need its own
+// quote handling before landing in an attribute.
 var esc = strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace
 
 func marker(status store.OperationStatus) string {
