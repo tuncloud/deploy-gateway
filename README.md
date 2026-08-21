@@ -148,30 +148,33 @@ there is no automated integration test that will catch a shape change.
 1. Get a service-account token:
 
    ```bash
-   curl -s -X POST \
+   TOKEN=$(curl -s -X POST \
      "$KEYCLOAK_BASE_URL/realms/$KEYCLOAK_REALM/protocol/openid-connect/token" \
      -d grant_type=client_credentials \
      -d client_id="$KEYCLOAK_CLIENT_ID" \
      -d client_secret="$KEYCLOAK_CLIENT_SECRET" \
-   | jq -r .access_token
+   | jq -r .access_token)
+   echo "${TOKEN:0:12}..."   # confirm it's non-empty without printing the whole token
    ```
 
 2. Resolve the resource-server client's UUID (its internal `id`, not its
    `clientId`):
 
    ```bash
-   curl -s -H "Authorization: Bearer $TOKEN" \
+   CLIENT_UUID=$(curl -s -H "Authorization: Bearer $TOKEN" \
      "$KEYCLOAK_BASE_URL/admin/realms/$KEYCLOAK_REALM/clients?clientId=deploy-gateway" \
-   | jq -r '.[0].id'
+   | jq -r '.[0].id')
+   echo "$CLIENT_UUID"
    ```
 
 3. Resolve a repository's user UUID. The repository slug contains a `/` and
    must be URL-encoded as `%2F`:
 
    ```bash
-   curl -s -H "Authorization: Bearer $TOKEN" \
+   USER_UUID=$(curl -s -H "Authorization: Bearer $TOKEN" \
      "$KEYCLOAK_BASE_URL/admin/realms/$KEYCLOAK_REALM/users?username=tuncloud%2Fbackend&exact=true" \
-   | jq -r '.[0].id'
+   | jq -r '.[0].id')
+   echo "$USER_UUID"
    ```
 
 4. Evaluate a decision:
@@ -183,6 +186,7 @@ there is no automated integration test that will catch a shape change.
      -d '{
        "resources": [{"name": "backend/backend-api", "scopes": [{"name": "deployment.restart"}]}],
        "userId": "'"$USER_UUID"'",
+       "entitlements": false,
        "context": {"attributes": {}}
      }' \
    | jq -r .status
@@ -215,9 +219,9 @@ written to the audit table as a denial.
 | Event | Effect |
 |---|---|
 | brief Keycloak blip | invisible; cached permits are served |
-| sustained outage | deploys fail closed within 5 minutes |
+| sustained outage | deploys fail closed within 5m30s of the last successful permit |
 | granting access | immediate |
-| revoking access | within 30s; up to 5 min during an outage |
+| revoking access | within 30s; up to 5m30s during an outage |
 
 `PERMIT` decisions are cached 30s and served up to 5 minutes past that only
 while Keycloak is unreachable. `DENY` is never cached. `/readyz` reports
@@ -343,7 +347,8 @@ podman build -t deploy-gateway:dev .
   `allowed_refs.deployment.rollout` to require a trusted branch for rollouts.
 - The Keycloak client secret is never logged: it sits in the API request path,
   so request URLs and transport errors are never surfaced.
-- An unreachable Keycloak fails closed (`503`), bounded by a 5-minute
-  stale-permit window. It is never reported as `403`.
+- An unreachable Keycloak fails closed (`503`), bounded by a 5m30s
+  stale-permit window (30s cache TTL plus a 5-minute stale grace period).
+  It is never reported as `403`.
 - The Telegram bot token is never logged: it sits in the API request path, so
   request URLs and transport errors are never surfaced.
