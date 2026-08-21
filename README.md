@@ -267,7 +267,7 @@ row.
 | granting access | immediate |
 | revoking a grant | within 30s; up to 5m30s during an outage |
 | narrowing a ref constraint | within 30s; up to 5m30s during an outage |
-| deleting a repository's Keycloak user | up to 10m — revoke the grant instead |
+| deleting a repository's Keycloak user | up to 10m30s; up to 15m30s during an outage — revoke the grant instead |
 
 `PERMIT` decisions are cached 30s and served up to 5 minutes past that only
 while Keycloak is unreachable. `DENY` is never cached.
@@ -279,9 +279,16 @@ same number for that reason — there is no second, longer delay hiding behind
 "within 30s".
 
 The one lookup with a longer cache is repository slug → Keycloak user UUID, at
-10 minutes. That is an identity mapping rather than a grant, so it never delays
-a revocation — but it does mean deleting a repository's user is not a fast way
-to cut that repository off. Remove the grant instead.
+10 minutes. That is an identity mapping rather than a grant, so removing the
+grant is never delayed by it — but deleting the user itself is: the stale
+UUID can be served for up to that full 10 minutes, and whatever decision it
+produces can then be cached for up to another 30s on top, so deleting a
+repository's user takes up to 10m30s to take effect normally, and up to
+15m30s while Keycloak is unreachable (the 5-minute stale-permit grace stacks
+on top of both). Deleting the user is therefore the slowest way to cut a
+repository off. Revoking the grant is faster — it propagates on the 30s
+decision-cache schedule instead of the 10-minute identity-cache one — so
+remove the grant, not the user.
 
 `/readyz` gates traffic rather than the process failing fast at boot, so a
 Keycloak that is unreachable at startup does not produce a crashlooping
@@ -337,10 +344,12 @@ The repository must be granted permission in Keycloak. To onboard a repository:
 
 Changes take effect without redeploying the gateway. Granting access is
 immediate. Revoking a grant and narrowing a ref constraint both take effect
-within 30 seconds — up to 5m30s if Keycloak is unreachable at the time. The one
-change that is not fast is deleting the repository's Keycloak user: that lookup
-is cached for 10 minutes, so revoke by removing the grant, not by deleting the
-user. Full timing table:
+within 30 seconds — up to 5m30s if Keycloak is unreachable at the time. The
+slowest change is deleting the repository's Keycloak user: that identity
+lookup is cached for 10 minutes on top of the 30s decision cache, so it takes
+up to 10m30s normally and up to 15m30s while Keycloak is unreachable. Revoke
+by removing the grant instead — it propagates on the faster 30s schedule, not
+the 10-minute one. Full timing table:
 [When Keycloak is unavailable](#when-keycloak-is-unavailable).
 
 ## Notifications
@@ -418,8 +427,10 @@ podman build -t deploy-gateway:dev .
 - Revoking a grant and narrowing a ref constraint both propagate within 30s
   (up to 5m30s during a Keycloak outage): ref constraints are cached for the
   same 30s as a decision, so there is one revocation number, not two. Deleting
-  a repository's Keycloak user is the exception — that lookup is cached 10
-  minutes — so revoke by removing the grant.
+  a repository's Keycloak user is the exception, and the slowest way to
+  revoke access — that identity lookup is cached 10 minutes on top of the 30s
+  decision cache, so it takes up to 10m30s (up to 15m30s during an outage) —
+  so revoke by removing the grant instead, which is faster.
 - The Keycloak client secret is never logged: it sits in the API request path,
   so request URLs and transport errors are never surfaced.
 - An unreachable Keycloak fails closed (`503`), bounded by a 5m30s
