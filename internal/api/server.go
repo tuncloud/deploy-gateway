@@ -28,7 +28,27 @@ type Deps struct {
 	Ops      *operation.Manager
 	Store    store.Store
 	Log      *slog.Logger
+
+	// AuthzTimeout bounds one whole authorization, not one HTTP attempt.
+	// Zero means defaultAuthzTimeout; tests set it small.
+	AuthzTimeout time.Duration
 }
+
+// defaultAuthzTimeout is the aggregate budget for a single Authorize call.
+//
+// The Keycloak client's own timeout bounds each HTTP attempt, not the
+// authorization: a cold-path request can make four admin calls, each with one
+// retry and some preceded by a token fetch, so per-attempt bounds alone stack
+// up to roughly 48s against a Keycloak that accepts connections and never
+// answers. The router's middleware.Timeout(30s) is the only thing that would
+// truncate that, and it is far too loose to be the bound — it is a
+// whole-request backstop, not an authz budget.
+//
+// 7s is the worst case the design allows for (3s per call, one retry). A
+// request that exceeds it has not been denied — Authorize returns an error,
+// which surfaces as 503 AUTHZ_UNAVAILABLE with no audit row, exactly like any
+// other way of failing to reach a decision.
+const defaultAuthzTimeout = 7 * time.Second
 
 // ReadinessChecker is implemented by authorizers that depend on a remote
 // service. Checked by /readyz; authorizers without a remote dependency simply
@@ -109,7 +129,14 @@ func (d *Deps) recordDenied(ctx context.Context, id *authn.GitHubIdentity,
 func (d *Deps) authorize(w http.ResponseWriter, r *http.Request,
 	id *authn.GitHubIdentity, action, namespace, deployment, container, image string) bool {
 
-	dec, err := d.Authz.Authorize(r.Context(), authz.Request{
+	timeout := d.AuthzTimeout
+	if timeout == 0 {
+		timeout = defaultAuthzTimeout
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), timeout)
+	defer cancel()
+
+	dec, err := d.Authz.Authorize(ctx, authz.Request{
 		Repository: id.Repository, Action: action,
 		Namespace: namespace, Deployment: deployment, Ref: id.Ref,
 	})

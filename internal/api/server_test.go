@@ -516,3 +516,164 @@ func TestRestartDeniedAuditWriteFailureStill403(t *testing.T) {
 		t.Fatalf("expected audit-write failure log, got: %s", logBuf.String())
 	}
 }
+
+// slowAuthz never answers on its own: it returns only when the caller's
+// context is done. It stands in for a Keycloak that accepts connections and
+// then goes quiet.
+type slowAuthz struct{}
+
+func (slowAuthz) Authorize(ctx context.Context, _ authz.Request) (authz.Decision, error) {
+	<-ctx.Done()
+	return authz.Decision{}, ctx.Err()
+}
+
+// deadlineAuthz records the deadline it was handed, so a test can assert the
+// aggregate budget exists and is the documented size.
+type deadlineAuthz struct {
+	hadDeadline bool
+	budget      time.Duration
+}
+
+func (d *deadlineAuthz) Authorize(ctx context.Context, _ authz.Request) (authz.Decision, error) {
+	if dl, ok := ctx.Deadline(); ok {
+		d.hadDeadline = true
+		d.budget = time.Until(dl)
+	}
+	return authz.Decision{Allowed: true}, nil
+}
+
+func newDepsAuthzTimeout(t *testing.T, a authz.Authorizer, timeout time.Duration) (http.Handler, func() []*store.Operation) {
+	t.Helper()
+	st := store.NewRecording()
+	m := operation.NewManager(&fakeKube{}, st, notify.Disabled(), slog.Default(), time.Minute)
+	v := authn.NewStaticVerifier(&authn.GitHubIdentity{
+		Repository: "tuncloud/backend", RepositoryID: "123", Actor: "tuando",
+		RunID: "1", RunAttempt: "1", EventName: "push", Workflow: "deploy.yml",
+		Ref: "refs/heads/main",
+	})
+	return api.NewRouter(api.Deps{
+		Verifier: v, Authz: a, Ops: m, Store: st, Log: slog.Default(),
+		AuthzTimeout: timeout,
+	}), st.Recorder()
+}
+
+// An authorization that never completes must hit the aggregate deadline and
+// come out as unavailability — not as a denial, and not as a hang that leaves
+// the caller's workflow waiting on the router's 30s backstop.
+func TestAuthzTimeoutIs503NotDenialAndWritesNoAuditRow(t *testing.T) {
+	h, rec := newDepsAuthzTimeout(t, slowAuthz{}, 20*time.Millisecond)
+
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		done <- doReq(h, http.MethodPost, "/v1/deployments/restart",
+			`{"namespace":"backend","deployment":"backend-api"}`, "t")
+	}()
+
+	select {
+	case w := <-done:
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("code = %d, want 503: an authz timeout is unavailability, "+
+				"never a denial", w.Code)
+		}
+		if !strings.Contains(w.Body.String(), "AUTHZ_UNAVAILABLE") {
+			t.Fatalf("body = %s, want AUTHZ_UNAVAILABLE", w.Body.String())
+		}
+		if ops := rec(); len(ops) != 0 {
+			t.Fatalf("recorded %d operations, want 0: a timeout must not be "+
+				"audited as a policy denial", len(ops))
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("request hung: the authorization has no aggregate deadline")
+	}
+}
+
+func TestRolloutAuthzTimeoutIs503(t *testing.T) {
+	h, rec := newDepsAuthzTimeout(t, slowAuthz{}, 20*time.Millisecond)
+	w := doReq(h, http.MethodPost, "/v1/deployments/rollout",
+		`{"namespace":"backend","deployment":"backend-api","image":"ghcr.io/o/a:v1"}`, "t")
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("code = %d, want 503", w.Code)
+	}
+	if ops := rec(); len(ops) != 0 {
+		t.Fatalf("recorded %d operations, want 0", len(ops))
+	}
+}
+
+// With no explicit AuthzTimeout the handler must still bound the call, at the
+// budget the design states (~7s) — not leave it to middleware.Timeout(30s).
+func TestAuthorizeAppliesDefaultAggregateDeadline(t *testing.T) {
+	da := &deadlineAuthz{}
+	h, _ := newDepsAuthz(t, da)
+	doReq(h, http.MethodPost, "/v1/deployments/restart",
+		`{"namespace":"backend","deployment":"backend-api"}`, "t")
+
+	if !da.hadDeadline {
+		t.Fatal("Authorize was called with no deadline: cfg.Timeout bounds one " +
+			"HTTP attempt, not the whole authorization")
+	}
+	if da.budget > 7*time.Second || da.budget < 6*time.Second {
+		t.Fatalf("authz budget = %v, want ~7s (the design's worst case), well "+
+			"inside the router's 30s backstop", da.budget)
+	}
+}
+
+// readyAuthz implements both authz.Authorizer and api.ReadinessChecker.
+type readyAuthz struct {
+	err error
+}
+
+func (r *readyAuthz) Authorize(context.Context, authz.Request) (authz.Decision, error) {
+	return authz.Decision{Allowed: true}, nil
+}
+func (r *readyAuthz) Ready(context.Context) error { return r.err }
+
+// /readyz is the sole enforcement of "startup never depends on Keycloak;
+// readiness gates traffic instead". If this branch were reordered or its type
+// assertion dropped, a gateway that cannot reach Keycloak would report ready
+// and 503 every deploy — with nothing failing.
+func TestReadyzNotReadyWhenAuthorizerNotReady(t *testing.T) {
+	h, _ := newDepsAuthz(t, &readyAuthz{err: errors.New("keycloak unreachable")})
+	w := doReq(h, http.MethodGet, "/readyz", "", "")
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("code = %d, want 503 while the authorizer is not ready", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "AUTHZ_UNAVAILABLE") {
+		t.Fatalf("body = %s, want AUTHZ_UNAVAILABLE", w.Body.String())
+	}
+}
+
+func TestReadyzReadyWhenAuthorizerReady(t *testing.T) {
+	h, _ := newDepsAuthz(t, &readyAuthz{})
+	w := doReq(h, http.MethodGet, "/readyz", "", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200: a ready authorizer must not hold back traffic", w.Code)
+	}
+	if w.Body.String() != "ok" {
+		t.Fatalf("body = %q, want ok", w.Body.String())
+	}
+}
+
+// The file backend has no remote dependency and deliberately implements no
+// Ready. Readiness must not require the interface.
+func TestReadyzReadyWhenAuthorizerHasNoReadyMethod(t *testing.T) {
+	if _, ok := any(&authz.FileAuthorizer{}).(api.ReadinessChecker); ok {
+		t.Fatal("this test needs a backend that does NOT implement ReadinessChecker")
+	}
+	h, _ := newDeps(t, testPolicy, false) // the real file authorizer
+	w := doReq(h, http.MethodGet, "/readyz", "", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200: an authorizer without a remote "+
+			"dependency must not gate readiness", w.Code)
+	}
+}
+
+// Shadow mode deliberately implements no Ready: the file policy is
+// authoritative there, so a broken Keycloak must not withhold traffic. That is
+// correct, and it is why the README qualifies its /readyz claim — an operator
+// validating in shadow mode learns nothing about Keycloak from /readyz.
+func TestShadowDoesNotGateReadiness(t *testing.T) {
+	if _, ok := any(&authz.Shadow{}).(api.ReadinessChecker); ok {
+		t.Fatal("Shadow must not implement ReadinessChecker: in shadow mode a " +
+			"Keycloak problem must never withhold traffic")
+	}
+}
