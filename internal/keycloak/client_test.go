@@ -150,6 +150,93 @@ func TestClientEvaluateRetriesOnce(t *testing.T) {
 	}
 }
 
+// A 401 mid-lifetime must invalidate the cached token and retry with a fresh
+// one — not just retry with the same (rejected) token.
+func TestClientEvaluate401InvalidatesTokenAndRetries(t *testing.T) {
+	var tokenCalls, evaluateCalls int32
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/realms/master/protocol/openid-connect/token",
+		func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(&tokenCalls, 1)
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"access_token":"tok","expires_in":300}`))
+		})
+	mux.HandleFunc("/admin/realms/master/clients",
+		func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`[{"id":"client-uuid-1","clientId":"deploy-gateway"}]`))
+		})
+	mux.HandleFunc("/admin/realms/master/clients/client-uuid-1/authz/resource-server/policy/evaluate",
+		func(w http.ResponseWriter, r *http.Request) {
+			n := atomic.AddInt32(&evaluateCalls, 1)
+			if n == 1 {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"status":"PERMIT","results":[{"status":"PERMIT"}]}`))
+		})
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := NewClient(testConfig(srv.URL), slog.Default(), newTestClock())
+	c.hc = srv.Client()
+
+	allowed, err := c.Evaluate(context.Background(), "user-uuid-1",
+		"backend/backend-api", "deployment.rollout")
+	if err != nil {
+		t.Fatalf("Evaluate returned error after 401-then-retry: %v", err)
+	}
+	if !allowed {
+		t.Fatal("Evaluate must return allowed=true once the retry succeeds with PERMIT")
+	}
+	if n := atomic.LoadInt32(&evaluateCalls); n != 2 {
+		t.Fatalf("evaluate endpoint called %d times, want 2", n)
+	}
+	if n := atomic.LoadInt32(&tokenCalls); n != 2 {
+		t.Fatalf("token endpoint called %d times, want 2 (401 must invalidate the cached token)", n)
+	}
+}
+
+// A non-401 4xx is not transient and must not be retried.
+func TestClientEvaluate4xxNotRetried(t *testing.T) {
+	var evaluateCalls int32
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/realms/master/protocol/openid-connect/token",
+		func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"access_token":"tok","expires_in":300}`))
+		})
+	mux.HandleFunc("/admin/realms/master/clients",
+		func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`[{"id":"client-uuid-1","clientId":"deploy-gateway"}]`))
+		})
+	mux.HandleFunc("/admin/realms/master/clients/client-uuid-1/authz/resource-server/policy/evaluate",
+		func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(&evaluateCalls, 1)
+			http.Error(w, "forbidden", http.StatusForbidden)
+		})
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := NewClient(testConfig(srv.URL), slog.Default(), newTestClock())
+	c.hc = srv.Client()
+
+	_, err := c.Evaluate(context.Background(), "user-uuid-1",
+		"backend/backend-api", "deployment.rollout")
+	if err == nil {
+		t.Fatal("a non-401 4xx must be an error")
+	}
+	if n := atomic.LoadInt32(&evaluateCalls); n != 1 {
+		t.Fatalf("evaluate endpoint called %d times, want 1 (non-401 4xx must not be retried)", n)
+	}
+}
+
 func TestClientUserIDFound(t *testing.T) {
 	s := &kcStub{evaluateStatus: "PERMIT", userFound: true}
 	c, srv := newTestClient(t, s)
