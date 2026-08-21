@@ -24,10 +24,17 @@ type TokenVerifier interface {
 
 type Deps struct {
 	Verifier TokenVerifier
-	Policy   *authz.Policy
+	Authz    authz.Authorizer
 	Ops      *operation.Manager
 	Store    store.Store
 	Log      *slog.Logger
+}
+
+// ReadinessChecker is implemented by authorizers that depend on a remote
+// service. Checked by /readyz; authorizers without a remote dependency simply
+// do not implement it.
+type ReadinessChecker interface {
+	Ready(ctx context.Context) error
 }
 
 type ctxKeyIdentity struct{}
@@ -64,6 +71,68 @@ func identityFrom(r *http.Request) *authn.GitHubIdentity {
 	return id
 }
 
+// recordDenied writes the audit row for a rejected request. Both handlers
+// share it: a denial row must look the same whichever action was refused.
+func (d *Deps) recordDenied(ctx context.Context, id *authn.GitHubIdentity,
+	action, namespace, deployment, container, image, reason string) {
+
+	now := time.Now().UTC()
+	if err := d.Store.PutOperation(ctx, &store.Operation{
+		OperationID: operation.NewOperationID(),
+		Repository:  id.Repository, RepositoryID: id.RepositoryID,
+		RepositoryOwner: id.RepositoryOwner, Actor: id.Actor,
+		Workflow: id.Workflow, WorkflowRef: id.WorkflowRef,
+		RunID: id.RunID, RunAttempt: id.RunAttempt, EventName: id.EventName,
+		Action:    action,
+		Namespace: namespace, Deployment: deployment,
+		Container: container, Image: image,
+		NsDep:        namespace + "#" + deployment,
+		Status:       store.StatusDenied,
+		ErrorCode:    "DENIED",
+		ErrorMessage: reason,
+		RequestedAt:  now,
+		ExpiresAt:    now.Add(365 * 24 * time.Hour).Unix(),
+		Events:       []store.AuditEvent{{Event: "DENIED", At: now}},
+	}); err != nil {
+		// err is a store-side error (no token/claims content) — surface it so
+		// a denied request never silently vanishes from the audit trail.
+		d.Log.Error("denied audit write failed",
+			"repository", id.Repository,
+			"namespace", namespace, "deployment", deployment, "err", err)
+	}
+	d.Log.Warn("denied", "repository", id.Repository,
+		"namespace", namespace, "deployment", deployment, "reason", reason)
+}
+
+// authorize resolves the three-outcome contract. It returns false when the
+// response has already been written, so the handler must simply return.
+func (d *Deps) authorize(w http.ResponseWriter, r *http.Request,
+	id *authn.GitHubIdentity, action, namespace, deployment, container, image string) bool {
+
+	dec, err := d.Authz.Authorize(r.Context(), authz.Request{
+		Repository: id.Repository, Action: action,
+		Namespace: namespace, Deployment: deployment, Ref: id.Ref,
+	})
+	if err != nil {
+		// The decision could not be reached. This is NOT a denial: reporting it
+		// as 403 would tell the caller their permissions are wrong when they
+		// are not, and would poison the audit table with a false denial.
+		d.Log.Error("authorization unavailable",
+			"repository", id.Repository, "action", action,
+			"namespace", namespace, "deployment", deployment, "err", err)
+		writeError(w, http.StatusServiceUnavailable, "AUTHZ_UNAVAILABLE",
+			"authorization service unavailable")
+		return false
+	}
+	if !dec.Allowed {
+		d.recordDenied(r.Context(), id, action, namespace, deployment,
+			container, image, dec.Reason)
+		writeError(w, http.StatusForbidden, "FORBIDDEN", "not allowed")
+		return false
+	}
+	return true
+}
+
 func (d *Deps) handleRestart(w http.ResponseWriter, r *http.Request) {
 	id := identityFrom(r)
 
@@ -77,34 +146,8 @@ func (d *Deps) handleRestart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !d.Policy.Authorize(id.Repository, operation.ActionRestart, body.Namespace, body.Deployment) {
-		now := time.Now().UTC()
-		if err := d.Store.PutOperation(r.Context(), &store.Operation{
-			OperationID: operation.NewOperationID(),
-			Repository:  id.Repository, RepositoryID: id.RepositoryID,
-			RepositoryOwner: id.RepositoryOwner, Actor: id.Actor,
-			Workflow: id.Workflow, WorkflowRef: id.WorkflowRef,
-			RunID: id.RunID, RunAttempt: id.RunAttempt, EventName: id.EventName,
-			Action:    operation.ActionRestart,
-			Namespace: body.Namespace, Deployment: body.Deployment,
-			NsDep:     body.Namespace + "#" + body.Deployment,
-			Status:    store.StatusDenied,
-			ErrorCode: "DENIED",
-			ErrorMessage: "policy does not allow " + operation.ActionRestart +
-				" on " + body.Namespace + "/" + body.Deployment,
-			RequestedAt: now,
-			ExpiresAt:   now.Add(365 * 24 * time.Hour).Unix(),
-			Events:      []store.AuditEvent{{Event: "DENIED", At: now}},
-		}); err != nil {
-			// err is a store-side error (no token/claims content) — surface it so
-			// a denied request never silently vanishes from the audit trail.
-			d.Log.Error("denied audit write failed",
-				"repository", id.Repository,
-				"namespace", body.Namespace, "deployment", body.Deployment, "err", err)
-		}
-		d.Log.Warn("denied", "repository", id.Repository,
-			"namespace", body.Namespace, "deployment", body.Deployment)
-		writeError(w, http.StatusForbidden, "FORBIDDEN", "not allowed")
+	if !d.authorize(w, r, id, operation.ActionRestart,
+		body.Namespace, body.Deployment, "", "") {
 		return
 	}
 
@@ -144,35 +187,8 @@ func (d *Deps) handleRollout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !d.Policy.Authorize(id.Repository, operation.ActionRollout, body.Namespace, body.Deployment) {
-		now := time.Now().UTC()
-		if err := d.Store.PutOperation(r.Context(), &store.Operation{
-			OperationID: operation.NewOperationID(),
-			Repository:  id.Repository, RepositoryID: id.RepositoryID,
-			RepositoryOwner: id.RepositoryOwner, Actor: id.Actor,
-			Workflow: id.Workflow, WorkflowRef: id.WorkflowRef,
-			RunID: id.RunID, RunAttempt: id.RunAttempt, EventName: id.EventName,
-			Action:    operation.ActionRollout,
-			Namespace: body.Namespace, Deployment: body.Deployment,
-			Container: body.Container, Image: body.Image,
-			NsDep:     body.Namespace + "#" + body.Deployment,
-			Status:    store.StatusDenied,
-			ErrorCode: "DENIED",
-			ErrorMessage: "policy does not allow " + operation.ActionRollout +
-				" on " + body.Namespace + "/" + body.Deployment,
-			RequestedAt: now,
-			ExpiresAt:   now.Add(365 * 24 * time.Hour).Unix(),
-			Events:      []store.AuditEvent{{Event: "DENIED", At: now}},
-		}); err != nil {
-			// err is a store-side error (no token/claims content) — surface it so
-			// a denied request never silently vanishes from the audit trail.
-			d.Log.Error("denied audit write failed",
-				"repository", id.Repository,
-				"namespace", body.Namespace, "deployment", body.Deployment, "err", err)
-		}
-		d.Log.Warn("denied", "repository", id.Repository,
-			"namespace", body.Namespace, "deployment", body.Deployment)
-		writeError(w, http.StatusForbidden, "FORBIDDEN", "not allowed")
+	if !d.authorize(w, r, id, operation.ActionRollout,
+		body.Namespace, body.Deployment, body.Container, body.Image) {
 		return
 	}
 
@@ -235,6 +251,17 @@ func (d *Deps) handleReadyz(w http.ResponseWriter, r *http.Request) {
 		d.Log.Error("readiness check failed", "err", err)
 		writeError(w, http.StatusServiceUnavailable, "STORE_UNAVAILABLE", "store not reachable")
 		return
+	}
+	// Authorizers with a remote dependency gate readiness too, so Kubernetes
+	// withholds traffic from a gateway that cannot authorize — rather than the
+	// process failing fast at boot and crashlooping.
+	if rc, ok := d.Authz.(ReadinessChecker); ok {
+		if err := rc.Ready(r.Context()); err != nil {
+			d.Log.Error("readiness check failed", "err", err)
+			writeError(w, http.StatusServiceUnavailable, "AUTHZ_UNAVAILABLE",
+				"authorization service not reachable")
+			return
+		}
 	}
 	w.Write([]byte("ok"))
 }

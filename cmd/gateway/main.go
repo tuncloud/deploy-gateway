@@ -39,7 +39,7 @@ func main() {
 	table := envOr("DYNAMO_TABLE", "deploy-gateway-operations")
 	addr := ":" + envOr("PORT", "8080")
 
-	policy, err := authz.LoadPolicy(policyPath)
+	authorizer, err := authz.NewFileAuthorizer(policyPath)
 	if err != nil {
 		logger.Error("load policy", "err", err)
 		os.Exit(1)
@@ -71,7 +71,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           api.NewRouter(api.Deps{Verifier: verifier, Policy: policy, Ops: ops, Store: st, Log: logger}),
+		Handler:           api.NewRouter(api.Deps{Verifier: verifier, Authz: authorizer, Ops: ops, Store: st, Log: logger}),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 

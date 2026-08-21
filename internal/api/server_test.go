@@ -56,6 +56,23 @@ func (f *fakeKube) WatchDeployment(context.Context, string, string) (watch.Inter
 
 var errPatch = errors.New("patch failed")
 
+// fakeAuthz implements authz.Authorizer. err simulates unavailability;
+// allowed/reason simulate a reached decision.
+type fakeAuthz struct {
+	allowed bool
+	reason  string
+	err     error
+	seen    []authz.Request
+}
+
+func (f *fakeAuthz) Authorize(_ context.Context, req authz.Request) (authz.Decision, error) {
+	f.seen = append(f.seen, req)
+	if f.err != nil {
+		return authz.Decision{}, f.err
+	}
+	return authz.Decision{Allowed: f.allowed, Reason: f.reason}, nil
+}
+
 func newDeps(t *testing.T, policyYAML string, failPatch bool) (http.Handler, func() []*store.Operation) {
 	t.Helper()
 	return newDepsK(t, policyYAML, &fakeKube{failPatch: failPatch})
@@ -65,7 +82,7 @@ func newDepsK(t *testing.T, policyYAML string, k kube.Kube) (http.Handler, func(
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "p.yaml")
 	os.WriteFile(path, []byte(policyYAML), 0o644)
-	pol, err := authz.LoadPolicy(path)
+	a, err := authz.NewFileAuthorizer(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +94,21 @@ func newDepsK(t *testing.T, policyYAML string, k kube.Kube) (http.Handler, func(
 		Repository: "tuncloud/backend", RepositoryID: "123", Actor: "tuando",
 		RunID: "1", RunAttempt: "1", EventName: "push", Workflow: "deploy.yml",
 	})
-	return api.NewRouter(api.Deps{Verifier: v, Policy: pol, Ops: m, Store: st, Log: slog.Default()}), st.Recorder()
+	return api.NewRouter(api.Deps{Verifier: v, Authz: a, Ops: m, Store: st, Log: slog.Default()}), st.Recorder()
+}
+
+func newDepsAuthz(t *testing.T, a authz.Authorizer) (http.Handler, func() []*store.Operation) {
+	t.Helper()
+	st := store.NewRecording()
+	m := operation.NewManager(&fakeKube{}, st, notify.Disabled(), slog.Default(), time.Minute)
+	v := authn.NewStaticVerifier(&authn.GitHubIdentity{
+		Repository: "tuncloud/backend", RepositoryID: "123", Actor: "tuando",
+		RunID: "1", RunAttempt: "1", EventName: "push", Workflow: "deploy.yml",
+		Ref: "refs/heads/main",
+	})
+	return api.NewRouter(api.Deps{
+		Verifier: v, Authz: a, Ops: m, Store: st, Log: slog.Default(),
+	}), st.Recorder()
 }
 
 const testPolicy = `version: 1
@@ -258,6 +289,93 @@ func TestRolloutPatchFail502WithOpID(t *testing.T) {
 	}
 }
 
+func TestRestartAllowedReturns202(t *testing.T) {
+	h, _ := newDepsAuthz(t, &fakeAuthz{allowed: true})
+	w := doReq(h, http.MethodPost, "/v1/deployments/restart",
+		`{"namespace":"backend","deployment":"backend-api"}`, "t")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("code = %d, want 202", w.Code)
+	}
+}
+
+func TestRestartDeniedReturns403AndWritesAuditRow(t *testing.T) {
+	h, rec := newDepsAuthz(t, &fakeAuthz{allowed: false, reason: "no grant"})
+	w := doReq(h, http.MethodPost, "/v1/deployments/restart",
+		`{"namespace":"backend","deployment":"backend-api"}`, "t")
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("code = %d, want 403", w.Code)
+	}
+	ops := rec()
+	if len(ops) != 1 {
+		t.Fatalf("recorded %d operations, want 1 denial row", len(ops))
+	}
+	if ops[0].Status != store.StatusDenied {
+		t.Fatalf("status = %q, want denied", ops[0].Status)
+	}
+	if ops[0].ErrorMessage != "no grant" {
+		t.Fatalf("ErrorMessage = %q, want the authorizer's reason", ops[0].ErrorMessage)
+	}
+}
+
+// The central invariant: an unreachable authorizer is 503, not 403, and must
+// not write a denial row that would misattribute an outage to a policy decision.
+func TestRestartAuthzUnavailableReturns503AndWritesNoAuditRow(t *testing.T) {
+	h, rec := newDepsAuthz(t, &fakeAuthz{err: errors.New("keycloak down")})
+	w := doReq(h, http.MethodPost, "/v1/deployments/restart",
+		`{"namespace":"backend","deployment":"backend-api"}`, "t")
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("code = %d, want 503", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "AUTHZ_UNAVAILABLE") {
+		t.Fatalf("body = %s, want AUTHZ_UNAVAILABLE", w.Body.String())
+	}
+	if ops := rec(); len(ops) != 0 {
+		t.Fatalf("recorded %d operations, want 0 on unavailability", len(ops))
+	}
+}
+
+func TestRolloutAuthzUnavailableReturns503(t *testing.T) {
+	h, rec := newDepsAuthz(t, &fakeAuthz{err: errors.New("keycloak down")})
+	w := doReq(h, http.MethodPost, "/v1/deployments/rollout",
+		`{"namespace":"backend","deployment":"backend-api","image":"ghcr.io/o/a:v1"}`, "t")
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("code = %d, want 503", w.Code)
+	}
+	if ops := rec(); len(ops) != 0 {
+		t.Fatalf("recorded %d operations, want 0", len(ops))
+	}
+}
+
+func TestRolloutDeniedAuditRowKeepsImageAndContainer(t *testing.T) {
+	h, rec := newDepsAuthz(t, &fakeAuthz{allowed: false, reason: "no grant"})
+	doReq(h, http.MethodPost, "/v1/deployments/rollout",
+		`{"namespace":"backend","deployment":"backend-api","container":"api","image":"ghcr.io/o/a:v1"}`, "t")
+	ops := rec()
+	if len(ops) != 1 {
+		t.Fatalf("recorded %d operations, want 1", len(ops))
+	}
+	if ops[0].Image != "ghcr.io/o/a:v1" || ops[0].Container != "api" {
+		t.Fatalf("denial row lost rollout detail: %+v", ops[0])
+	}
+}
+
+// The ref claim must reach the authorizer, or ref constraints can never apply.
+func TestHandlersPassRefToAuthorizer(t *testing.T) {
+	fa := &fakeAuthz{allowed: true}
+	h, _ := newDepsAuthz(t, fa)
+	doReq(h, http.MethodPost, "/v1/deployments/restart",
+		`{"namespace":"backend","deployment":"backend-api"}`, "t")
+	if len(fa.seen) != 1 {
+		t.Fatalf("authorizer saw %d requests, want 1", len(fa.seen))
+	}
+	if fa.seen[0].Ref != "refs/heads/main" {
+		t.Fatalf("Ref = %q, want refs/heads/main", fa.seen[0].Ref)
+	}
+	if fa.seen[0].Action != operation.ActionRestart {
+		t.Fatalf("Action = %q, want %q", fa.seen[0].Action, operation.ActionRestart)
+	}
+}
+
 func TestGetOperation(t *testing.T) {
 	h, _ := newDeps(t, testPolicy, false)
 	w := doReq(h, http.MethodPost, "/v1/deployments/restart", `{"namespace":"backend","deployment":"backend-api"}`, "tok")
@@ -340,12 +458,12 @@ func newDepsCustom(t *testing.T, v api.TokenVerifier, st store.Store, log *slog.
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "p.yaml")
 	os.WriteFile(path, []byte(testPolicy), 0o644)
-	pol, err := authz.LoadPolicy(path)
+	a, err := authz.NewFileAuthorizer(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	m := operation.NewManager(&fakeKube{}, st, notify.Disabled(), log, time.Minute)
-	return api.NewRouter(api.Deps{Verifier: v, Policy: pol, Ops: m, Store: st, Log: log})
+	return api.NewRouter(api.Deps{Verifier: v, Authz: a, Ops: m, Store: st, Log: log})
 }
 
 func TestRestartRejectedToken401GenericBodyNoEcho(t *testing.T) {
