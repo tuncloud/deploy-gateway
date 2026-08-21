@@ -35,7 +35,7 @@ func (s *authzStub) server(t *testing.T) *httptest.Server {
 				http.Error(w, "down", http.StatusServiceUnavailable)
 				return
 			}
-			w.Write([]byte(`[{"id":"cu1"}]`))
+			w.Write([]byte(`[{"id":"cu1","clientId":"deploy-gateway"}]`))
 		})
 	mux.HandleFunc("/admin/realms/master/users",
 		func(w http.ResponseWriter, r *http.Request) {
@@ -43,7 +43,7 @@ func (s *authzStub) server(t *testing.T) *httptest.Server {
 				http.Error(w, "down", http.StatusServiceUnavailable)
 				return
 			}
-			w.Write([]byte(`[{"id":"uu1"}]`))
+			w.Write([]byte(`[{"id":"uu1","username":"tuncloud/backend"}]`))
 		})
 	mux.HandleFunc("/admin/realms/master/clients/cu1/authz/resource-server/resource",
 		func(w http.ResponseWriter, r *http.Request) {
@@ -53,7 +53,7 @@ func (s *authzStub) server(t *testing.T) *httptest.Server {
 			}
 			body := s.refs
 			if body == "" {
-				body = `[{"_id":"r1","attributes":{}}]`
+				body = `[{"_id":"r1","name":"backend/backend-api","attributes":{}}]`
 			}
 			w.Write([]byte(body))
 		})
@@ -120,7 +120,7 @@ func TestAuthorizerDenyCarriesReason(t *testing.T) {
 func TestAuthorizerRefMismatchDenies(t *testing.T) {
 	s := &authzStub{
 		status: "PERMIT",
-		refs:   `[{"_id":"r1","attributes":{"allowed_refs.deployment.rollout":["refs/heads/main"]}}]`,
+		refs:   `[{"_id":"r1","name":"backend/backend-api","attributes":{"allowed_refs.deployment.rollout":["refs/heads/main"]}}]`,
 	}
 	a, srv := newTestAuthorizer(t, s, newTestClock())
 	defer srv.Close()
@@ -143,7 +143,7 @@ func TestAuthorizerRefMismatchDenies(t *testing.T) {
 func TestAuthorizerRefDenialReasonDiffersFromGrantDenial(t *testing.T) {
 	refStub := &authzStub{
 		status: "PERMIT",
-		refs:   `[{"_id":"r1","attributes":{"allowed_refs.deployment.rollout":["refs/heads/main"]}}]`,
+		refs:   `[{"_id":"r1","name":"backend/backend-api","attributes":{"allowed_refs.deployment.rollout":["refs/heads/main"]}}]`,
 	}
 	a1, s1 := newTestAuthorizer(t, refStub, newTestClock())
 	defer s1.Close()
@@ -164,7 +164,7 @@ func TestAuthorizerRefDenialReasonDiffersFromGrantDenial(t *testing.T) {
 func TestAuthorizerMalformedRefConstraintDenies(t *testing.T) {
 	s := &authzStub{
 		status: "PERMIT",
-		refs:   `[{"_id":"r1","attributes":{"allowed_refs.deployment.rollout":["refs/*/main"]}}]`,
+		refs:   `[{"_id":"r1","name":"backend/backend-api","attributes":{"allowed_refs.deployment.rollout":["refs/*/main"]}}]`,
 	}
 	a, srv := newTestAuthorizer(t, s, newTestClock())
 	defer srv.Close()
@@ -185,7 +185,7 @@ func TestAuthorizerNoSubjectDenies(t *testing.T) {
 		case "/realms/master/protocol/openid-connect/token":
 			w.Write([]byte(`{"access_token":"tok","expires_in":300}`))
 		case "/admin/realms/master/clients":
-			w.Write([]byte(`[{"id":"cu1"}]`))
+			w.Write([]byte(`[{"id":"cu1","clientId":"deploy-gateway"}]`))
 		case "/admin/realms/master/users":
 			w.Write([]byte(`[]`))
 		default:

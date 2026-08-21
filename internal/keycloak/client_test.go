@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -276,5 +277,142 @@ func TestClientResourceServerUUIDCached(t *testing.T) {
 		if got != "client-uuid-1" {
 			t.Fatalf("ResourceServerUUID = %q", got)
 		}
+	}
+}
+
+// listStub serves the two admin list endpoints with caller-supplied bodies, so
+// a test can hand back a response whose element zero is a near-miss.
+func listStub(t *testing.T, clientsJSON, usersJSON string) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/realms/master/protocol/openid-connect/token",
+		func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(`{"access_token":"tok","expires_in":300}`))
+		})
+	mux.HandleFunc("/admin/realms/master/clients",
+		func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(clientsJSON))
+		})
+	mux.HandleFunc("/admin/realms/master/users",
+		func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(usersJSON))
+		})
+	return httptest.NewServer(mux)
+}
+
+// If ?clientId= turns out not to filter exactly, element zero can be another
+// client entirely — and its UUID would become the resource server for every
+// evaluate call, for the process's whole lifetime.
+func TestClientResourceServerUUIDRejectsWrongClientID(t *testing.T) {
+	srv := listStub(t, `[{"id":"other-uuid","clientId":"deploy-gateway-admin"}]`, `[]`)
+	defer srv.Close()
+	c := clientFor(t, srv)
+
+	got, err := c.ResourceServerUUID(context.Background())
+	if err == nil {
+		t.Fatalf("ResourceServerUUID = %q, want an error: element zero is a "+
+			"different client and must never be used", got)
+	}
+}
+
+func TestClientResourceServerUUIDScansPastNearMiss(t *testing.T) {
+	srv := listStub(t, `[{"id":"wrong-uuid","clientId":"deploy-gateway-admin"},
+		{"id":"client-uuid-1","clientId":"deploy-gateway"}]`, `[]`)
+	defer srv.Close()
+
+	got, err := clientFor(t, srv).ResourceServerUUID(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "client-uuid-1" {
+		t.Fatalf("ResourceServerUUID = %q, want client-uuid-1 (must match on "+
+			"clientId, not on position)", got)
+	}
+}
+
+// The identity-swap case: a lookup for tuncloud/backend that infix-matches
+// returns tuncloud/backend-api first. Accepting it would evaluate this deploy
+// against another repository's grants, and cache that for userIDTTL.
+func TestClientUserIDNearMissIsErrNoSubject(t *testing.T) {
+	srv := listStub(t, `[{"id":"client-uuid-1","clientId":"deploy-gateway"}]`,
+		`[{"id":"user-uuid-api","username":"tuncloud/backend-api"}]`)
+	defer srv.Close()
+
+	got, err := clientFor(t, srv).UserID(context.Background(), "tuncloud/backend")
+	if !errors.Is(err, ErrNoSubject) {
+		t.Fatalf("UserID = %q, err = %v; want ErrNoSubject — a near-miss "+
+			"username must be a clean denial, never a substitute subject", got, err)
+	}
+}
+
+func TestClientUserIDScansPastNearMiss(t *testing.T) {
+	srv := listStub(t, `[{"id":"client-uuid-1","clientId":"deploy-gateway"}]`,
+		`[{"id":"user-uuid-api","username":"tuncloud/backend-api"},
+		  {"id":"user-uuid-1","username":"tuncloud/backend"}]`)
+	defer srv.Close()
+
+	got, err := clientFor(t, srv).UserID(context.Background(), "tuncloud/backend")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "user-uuid-1" {
+		t.Fatalf("UserID = %q, want user-uuid-1 (must match on username, not "+
+			"on position)", got)
+	}
+}
+
+// Keycloak folds usernames to lower case, so a repository slug with capitals
+// must still resolve — the identity check tightens near-misses without
+// breaking a correctly onboarded repo.
+func TestClientUserIDMatchesCaseInsensitively(t *testing.T) {
+	srv := listStub(t, `[{"id":"client-uuid-1","clientId":"deploy-gateway"}]`,
+		`[{"id":"user-uuid-1","username":"tuncloud/backend"}]`)
+	defer srv.Close()
+
+	got, err := clientFor(t, srv).UserID(context.Background(), "tuncloud/Backend")
+	if err != nil {
+		t.Fatalf("a case-folded username must still resolve: %v", err)
+	}
+	if got != "user-uuid-1" {
+		t.Fatalf("UserID = %q, want user-uuid-1", got)
+	}
+}
+
+// An admin call's transport error must keep its cause: the whole point of the
+// error is triaging the outage that produced it. This is the counterpart of
+// token.go's deliberate vagueness — the client secret rides only in the token
+// endpoint's POST body, never in an admin URL, so there is nothing to protect
+// here by discarding the cause.
+func TestClientAdminTransportErrorWrapsCause(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/realms/master/protocol/openid-connect/token",
+		func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(`{"access_token":"tok","expires_in":300}`))
+		})
+	mux.HandleFunc("/admin/realms/master/clients",
+		func(w http.ResponseWriter, r *http.Request) {
+			// Drop the connection mid-request: a transport error, not a status.
+			if conn, _, err := w.(http.Hijacker).Hijack(); err == nil {
+				conn.Close()
+			}
+		})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := clientFor(t, srv)
+	_, err := c.ResourceServerUUID(context.Background())
+	if err == nil {
+		t.Fatal("a dropped connection must be an error")
+	}
+
+	var ue *url.Error
+	if !errors.As(err, &ue) {
+		t.Fatalf("err = %v; want the underlying transport error preserved in "+
+			"the chain, not a bare \"request failed\"", err)
+	}
+	if strings.Contains(err.Error(), "s3cr3t") {
+		t.Fatalf("error text leaked the client secret: %v", err)
 	}
 }
