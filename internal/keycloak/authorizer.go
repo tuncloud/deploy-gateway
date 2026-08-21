@@ -117,8 +117,21 @@ func (a *Authorizer) evaluate(ctx context.Context, req authz.Request) (authz.Dec
 	return authz.Decision{Allowed: true}, nil
 }
 
-// Ready reports whether Keycloak is reachable and the resource server client
-// resolves. Used to gate /readyz rather than to fail the process at boot.
+// Ready is a one-time startup gate, not a live health probe. It reports
+// not-ready until Keycloak has been reached successfully once (resolving the
+// resource server's UUID); after that first success, ResourceServerUUID's
+// result is cached for the Client's lifetime with no TTL, so Ready returns
+// nil on every later call regardless of Keycloak's ongoing reachability.
+//
+// That is deliberate, not a bug to "fix" by adding a TTL or by probing
+// Keycloak here: /readyz gates whether Kubernetes routes traffic to this
+// pod, and there is typically only one gateway replica. Failing readiness
+// during a Keycloak outage would pull that replica out of service entirely,
+// turning a clean 503 AUTHZ_UNAVAILABLE response into a connection failure
+// for every caller — worse for GitHub Actions, and no availability gain
+// since there is no healthy replica to route to instead. Ongoing Keycloak
+// unavailability is surfaced per request, by Authorize returning an error
+// (which the API layer turns into 503), not by readiness.
 func (a *Authorizer) Ready(ctx context.Context) error {
 	_, err := a.client.ResourceServerUUID(ctx)
 	return err

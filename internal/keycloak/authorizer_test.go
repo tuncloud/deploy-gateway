@@ -275,6 +275,35 @@ func TestAuthorizerFailsClosedBeyondStaleWindow(t *testing.T) {
 	}
 }
 
+// A live, reachable DENY must always win over a stale cached PERMIT: the
+// stale fallback exists only to ride out an outage, never to override an
+// answer Keycloak is actually giving right now.
+func TestAuthorizerLiveDenyOverridesStalePermit(t *testing.T) {
+	s := &authzStub{status: "PERMIT"}
+	clk := newTestClock()
+	a, srv := newTestAuthorizer(t, s, clk)
+	defer srv.Close()
+
+	dec, err := a.Authorize(context.Background(), rolloutReq())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !dec.Allowed {
+		t.Fatal("expected allowed")
+	}
+
+	clk.advance(2 * time.Minute) // past the 30s TTL, inside the 5m stale window
+	s.status = "DENY"            // Keycloak stays reachable but now denies
+
+	dec, err = a.Authorize(context.Background(), rolloutReq())
+	if err != nil {
+		t.Fatalf("a live, reachable DENY must not be an error: %v", err)
+	}
+	if dec.Allowed {
+		t.Fatal("a live DENY must override the stale cached PERMIT, not be masked by it")
+	}
+}
+
 func TestAuthorizerUnavailableIsErrorNotDenial(t *testing.T) {
 	s := &authzStub{status: "PERMIT"}
 	s.down.Store(true)
