@@ -31,6 +31,7 @@ type Client struct {
 	uuid   string
 
 	userIDs *cache[string]
+	refs    *cache[[]string]
 }
 
 // NewClient builds a Client. cfg.Timeout defaults to 3s if unset.
@@ -46,6 +47,7 @@ func NewClient(cfg Config, log *slog.Logger, clock Clock) *Client {
 		log:     log,
 		clock:   clock,
 		userIDs: newCache[string](10*time.Minute, 0, clock),
+		refs:    newCache[[]string](10*time.Minute, 0, clock),
 	}
 }
 
@@ -253,4 +255,63 @@ func (c *Client) Evaluate(ctx context.Context, userID, resource, scope string) (
 	default:
 		return false, fmt.Errorf("keycloak: unexpected evaluate status %q", out.Status)
 	}
+}
+
+// UNVERIFIED against a live Keycloak: this response shape — a JSON array of
+// resources each carrying an "attributes" map of string to string-slice — is
+// assumed from the Admin API's documented behaviour, not confirmed by a
+// spike. A mismatch yields no attributes, which reads as "unrestricted"; see
+// the note on AllowedRefs.
+type resourceRepresentation struct {
+	Attributes map[string][]string `json:"attributes"`
+}
+
+// AllowedRefs returns the ref constraints for a resource and action, most
+// specific first: "allowed_refs.<action>" wins over the bare "allowed_refs".
+// A nil result means unrestricted, and that is the deliberate, migration-safe
+// default: there was no ref check at all before Keycloak, so treating an
+// absent attribute as a denial would break every repository at cutover.
+//
+// This is the asymmetric case in this package: where Evaluate fails closed
+// on an unrecognised response shape (an error, never a silent decision), a
+// mismatch here has nowhere to signal through — it just decodes to no
+// attributes, which this method cannot distinguish from a resource that
+// genuinely has no ref constraint. So an unverified wrong guess about the
+// wire shape fails OPEN with respect to ref enforcement: refs would stop
+// being restricted, silently, with no error to surface it. That risk is why
+// the shape assumption is called out on resourceRepresentation above.
+func (c *Client) AllowedRefs(ctx context.Context, resource, action string) ([]string, error) {
+	key := resource + "\x00" + action
+	if v, ok := c.refs.Get(key); ok {
+		return v, nil
+	}
+
+	uuid, err := c.ResourceServerUUID(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	u := c.cfg.adminURL("/clients/" + url.PathEscape(uuid) +
+		"/authz/resource-server/resource?exactName=true&name=" + url.QueryEscape(resource))
+	raw, err := c.do(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var resources []resourceRepresentation
+	if err := json.Unmarshal(raw, &resources); err != nil {
+		return nil, fmt.Errorf("keycloak: decode resources: %w", err)
+	}
+
+	var out []string
+	if len(resources) > 0 {
+		attrs := resources[0].Attributes
+		if v, ok := attrs["allowed_refs."+action]; ok {
+			out = v
+		} else if v, ok := attrs["allowed_refs"]; ok {
+			out = v
+		}
+	}
+	c.refs.Put(key, out)
+	return out, nil
 }
