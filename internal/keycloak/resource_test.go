@@ -1,10 +1,12 @@
 package keycloak
 
 import (
+	"bytes"
 	"context"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 )
@@ -149,5 +151,34 @@ func TestAllowedRefsCachesPerResourceAndAction(t *testing.T) {
 	}
 	if n := atomic.LoadInt32(&resourceCalls); n != 2 {
 		t.Fatalf("resource endpoint called %d times, want 2 (per-action key)", n)
+	}
+}
+
+// A zero-resource lookup must still return (nil, nil) — unchanged semantics,
+// since AllowedRefs is only reached after Evaluate already permitted this
+// same resource name, so finding none here is a wiring/name-format bug that
+// this fail-open path can only surface via a log line, never an error.
+func TestAllowedRefsUnknownResourceLogsWarning(t *testing.T) {
+	srv := resourceServer(t, `[]`)
+	defer srv.Close()
+
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+	c := NewClient(testConfig(srv.URL), logger, newTestClock())
+	c.hc = srv.Client()
+
+	got, err := c.AllowedRefs(context.Background(), "backend/absent", "deployment.rollout")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != nil {
+		t.Fatalf("AllowedRefs = %v, want nil", got)
+	}
+	logged := logBuf.String()
+	if !strings.Contains(logged, "resource not found") {
+		t.Fatalf("expected a resource-not-found warning, got: %s", logged)
+	}
+	if !strings.Contains(logged, "backend/absent") || !strings.Contains(logged, "deployment.rollout") {
+		t.Fatalf("expected warning to name the resource and action, got: %s", logged)
 	}
 }

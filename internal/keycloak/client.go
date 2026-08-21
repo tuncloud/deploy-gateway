@@ -311,6 +311,16 @@ func (c *Client) AllowedRefs(ctx context.Context, resource, action string) ([]st
 		} else if v, ok := attrs["allowed_refs"]; ok {
 			out = v
 		}
+	} else {
+		// AllowedRefs is only reached after Evaluate already returned PERMIT
+		// for this same resource name, so finding zero resources here means
+		// the name this call asked about disagrees with the name Keycloak
+		// just matched a permission against — a wiring or name-format bug.
+		// This is the one path in the package that fails open, so this log
+		// line is the only observability that failure mode gets; the
+		// found-but-unconstrained case below stays silent on purpose.
+		c.log.Warn("keycloak resource not found; ref constraints cannot be applied",
+			"resource", resource, "action", action)
 	}
 	c.refs.Put(key, out)
 	return out, nil
