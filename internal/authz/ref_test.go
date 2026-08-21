@@ -42,10 +42,10 @@ func TestMatchRef(t *testing.T) {
 
 func TestMatchRefMalformedDenies(t *testing.T) {
 	malformed := [][]string{
-		{""},                        // empty pattern
-		{"refs/*/main"},             // star not at the end
-		{"refs/heads/**"},           // double star
-		{"refs/heads/main", "a*b"},  // one bad pattern poisons the set
+		{""},                       // empty pattern
+		{"refs/*/main"},            // star not at the end
+		{"refs/heads/**"},          // double star
+		{"refs/heads/main", "a*b"}, // one bad pattern poisons the set
 	}
 	for _, allowed := range malformed {
 		got, err := authz.MatchRef(allowed, "refs/heads/main")

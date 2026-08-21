@@ -89,8 +89,21 @@ Set a resource attribute to restrict which git refs may deploy it:
 | `allowed_refs` | fallback when no action-specific key is set |
 
 Values are matched as: `refs/heads/main` exactly, `*` for any ref, or a
-trailing glob such as `refs/heads/release/*` or `refs/tags/v*`. An absent
-attribute means unrestricted. A malformed value denies.
+trailing glob such as `refs/heads/release/*` or `refs/tags/v*`. A malformed
+value denies.
+
+**An absent attribute and `*` are not the same thing, and absent is the more
+permissive of the two.** Absent means the ref is never looked at, so a request
+that carries no ref claim at all is still allowed. `*` means "any ref" — and a
+request with no ref has no ref to match, so `*` denies it. Writing "any ref"
+explicitly is therefore strictly *stricter* than writing nothing. Leave the
+attribute off for a genuinely unrestricted resource; set `*` when you want the
+intent stated in the UI and accept that a ref-less request is refused.
+
+Changing one of these attributes takes effect within 30 seconds — the same
+window as granting or revoking a grant, because the gateway caches a ref
+constraint for exactly as long as it caches a decision. See
+[When Keycloak is unavailable](#when-keycloak-is-unavailable).
 
 This is how you grant `deployment.rollout` more narrowly than
 `deployment.restart` — a restart can't change code, a rollout can, so a restart
@@ -102,12 +115,21 @@ as a denial would break every repository at cutover. But it has a sharp edge
 the rest of this system doesn't share. Everywhere else, an unexpected Keycloak
 response fails *closed* — the gateway returns `503` rather than guess (see
 below). Ref constraints are the one exception: if the resource-attributes
-response doesn't decode the way the gateway expects, or a resource name
-doesn't match, it decodes to zero attributes — indistinguishable from a
-resource that's genuinely unrestricted. Ref constraints would then silently
-stop being enforced, with no error anywhere. The one signal is a log line,
+response doesn't decode the way the gateway expects, it decodes to zero
+attributes — indistinguishable from a resource that's genuinely unrestricted.
+Ref constraints would then silently stop being enforced, with no error
+anywhere. The one signal is a log line,
 `keycloak resource not found; ref constraints cannot be applied` — worth
 alerting on.
+
+The gateway does check the *identity* of what it reads: it uses a returned
+resource only if that resource's `name` is the one it asked for, and likewise
+matches on `username` for repository lookups and `clientId` for the resource
+server. So a list endpoint that doesn't filter exactly — returning
+`backend/backend-api-canary` for a `backend/backend-api` lookup — is treated as
+not-found and hits that log line, rather than quietly applying a neighbouring
+resource's constraints. What no check can catch is the attributes map itself
+being shaped differently than assumed.
 
 ### Required service-account roles
 
@@ -163,9 +185,13 @@ there is no automated integration test that will catch a shape change.
    ```bash
    CLIENT_UUID=$(curl -s -H "Authorization: Bearer $TOKEN" \
      "$KEYCLOAK_BASE_URL/admin/realms/$KEYCLOAK_REALM/clients?clientId=deploy-gateway" \
-   | jq -r '.[0].id')
+   | jq -r '.[] | select(.clientId == "deploy-gateway") | .id')
    echo "$CLIENT_UUID"
    ```
+
+   Note whether `?clientId=` filtered exactly or matched as a substring — the
+   `select` above is what the gateway does too, and if the filter is not exact
+   you will see extra entries here.
 
 3. Resolve a repository's user UUID. The repository slug contains a `/` and
    must be URL-encoded as `%2F`:
@@ -173,9 +199,16 @@ there is no automated integration test that will catch a shape change.
    ```bash
    USER_UUID=$(curl -s -H "Authorization: Bearer $TOKEN" \
      "$KEYCLOAK_BASE_URL/admin/realms/$KEYCLOAK_REALM/users?username=tuncloud%2Fbackend&exact=true" \
-   | jq -r '.[0].id')
+   | jq -r '.[] | select(.username | ascii_downcase == "tuncloud/backend") | .id')
    echo "$USER_UUID"
    ```
+
+   Confirm the array holds exactly the user asked for. If `exact=true` is not
+   honoured, a lookup for `tuncloud/backend` also returns
+   `tuncloud/backend-api`; the gateway checks the `username` before using an
+   entry and treats a near-miss as "no such repository" (a clean `403`), so a
+   non-exact filter shows up as an unexpected denial rather than as one
+   repository inheriting another's grants.
 
 4. Evaluate a decision:
 
@@ -203,9 +236,14 @@ there is no automated integration test that will catch a shape change.
    | jq .
    ```
 
-   Confirm the response is a JSON array whose first element has an
+   Confirm the response is a JSON array whose element for
+   `backend/backend-api` carries a `name` equal to what you asked for and an
    `attributes` object mapping each attribute name to an array of strings —
-   that's the shape ref-restriction lookups expect.
+   that's the shape ref-restriction lookups expect. The gateway matches on
+   `name` and ignores any other element, so if `exactName=true` is not
+   honoured you will see the constraint stop applying and the log line
+   `keycloak resource not found; ref constraints cannot be applied` appear,
+   rather than the wrong resource's constraint being used.
 
 If any of these differs from what's described here, update the corresponding
 types in `internal/keycloak/client.go` before relying on the affected path.
@@ -216,22 +254,49 @@ The gateway fails **closed** and returns `503 AUTHZ_UNAVAILABLE` — never `403`
 so an outage is never reported to a caller as a permissions problem and never
 written to the audit table as a denial.
 
+One authorization is bounded to 7s end to end — 3s per Keycloak call with one
+retry — so a Keycloak that accepts connections and then never answers degrades
+to `503` in seconds instead of stalling the caller's workflow. A request that
+runs out of that budget is unavailability, not a denial: no `403`, no audit
+row.
+
 | Event | Effect |
 |---|---|
 | brief Keycloak blip | invisible; cached permits are served |
 | sustained outage | deploys fail closed within 5m30s of the last successful permit |
 | granting access | immediate |
-| revoking access | within 30s; up to 5m30s during an outage |
+| revoking a grant | within 30s; up to 5m30s during an outage |
+| narrowing a ref constraint | within 30s; up to 5m30s during an outage |
+| deleting a repository's Keycloak user | up to 10m — revoke the grant instead |
 
 `PERMIT` decisions are cached 30s and served up to 5 minutes past that only
-while Keycloak is unreachable. `DENY` is never cached. `/readyz` reports
-not-ready until Keycloak has been reached once, so Kubernetes withholds traffic
-rather than the gateway crashlooping.
+while Keycloak is unreachable. `DENY` is never cached.
+
+Ref constraints (`allowed_refs*`) are cached for the same 30s, deliberately: a
+ref constraint is a policy control, so tightening one propagates on exactly the
+schedule that revoking a grant does. Both numbers in the table above are the
+same number for that reason — there is no second, longer delay hiding behind
+"within 30s".
+
+The one lookup with a longer cache is repository slug → Keycloak user UUID, at
+10 minutes. That is an identity mapping rather than a grant, so it never delays
+a revocation — but it does mean deleting a repository's user is not a fast way
+to cut that repository off. Remove the grant instead.
+
+`/readyz` gates traffic rather than the process failing fast at boot, so a
+Keycloak that is unreachable at startup does not produce a crashlooping
+gateway. **That gating applies in `keycloak` mode only**: there, readiness
+reports not-ready until Keycloak has been reached once. In `shadow` mode the
+file policy is authoritative and a Keycloak problem must never withhold
+traffic, so readiness deliberately does not consult Keycloak at all — which
+means a broken Keycloak configuration will *not* show up in `/readyz` during
+the validation window. Watch the logs for `shadow authorizer unavailable`
+instead. In `file` mode there is nothing to check.
 
 Log lines worth grepping: `authorization unavailable`,
 `serving stale authorization decision`, `malformed ref constraint, denying`,
 `keycloak resource not found; ref constraints cannot be applied`,
-`shadow authorizer disagrees`.
+`shadow authorizer disagrees`, `shadow authorizer unavailable`.
 
 ## Usage from a repository
 
@@ -271,7 +336,12 @@ The repository must be granted permission in Keycloak. To onboard a repository:
    resource and action.
 
 Changes take effect without redeploying the gateway. Granting access is
-immediate; revoking it takes effect within 30 seconds.
+immediate. Revoking a grant and narrowing a ref constraint both take effect
+within 30 seconds — up to 5m30s if Keycloak is unreachable at the time. The one
+change that is not fast is deleting the repository's Keycloak user: that lookup
+is cached for 10 minutes, so revoke by removing the grant, not by deleting the
+user. Full timing table:
+[When Keycloak is unavailable](#when-keycloak-is-unavailable).
 
 ## Notifications
 
@@ -345,6 +415,11 @@ podman build -t deploy-gateway:dev .
 - `deployment.rollout` controls which images run — grant it more narrowly than
   `deployment.restart` (a restart can't change code, a rollout can). Use
   `allowed_refs.deployment.rollout` to require a trusted branch for rollouts.
+- Revoking a grant and narrowing a ref constraint both propagate within 30s
+  (up to 5m30s during a Keycloak outage): ref constraints are cached for the
+  same 30s as a decision, so there is one revocation number, not two. Deleting
+  a repository's Keycloak user is the exception — that lookup is cached 10
+  minutes — so revoke by removing the grant.
 - The Keycloak client secret is never logged: it sits in the API request path,
   so request URLs and transport errors are never surfaced.
 - An unreachable Keycloak fails closed (`503`), bounded by a 5m30s
