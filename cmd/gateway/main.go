@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"github.com/tuncloud/deploy-gateway/internal/api"
 	"github.com/tuncloud/deploy-gateway/internal/authn"
 	"github.com/tuncloud/deploy-gateway/internal/authz"
+	"github.com/tuncloud/deploy-gateway/internal/keycloak"
 	"github.com/tuncloud/deploy-gateway/internal/kube"
 	"github.com/tuncloud/deploy-gateway/internal/notify"
 	"github.com/tuncloud/deploy-gateway/internal/operation"
@@ -30,6 +32,53 @@ func envOr(key, def string) string {
 	return def
 }
 
+// buildAuthorizer selects the authorization backend. Keycloak is resolved
+// lazily and never fails the process at boot: a Keycloak hiccup during a
+// gateway rollout must not produce a crashlooping gateway at the exact moment
+// deploys are needed. /readyz gates traffic instead.
+func buildAuthorizer(backend, policyPath string, logger *slog.Logger) (authz.Authorizer, error) {
+	kcConfig := func() keycloak.Config {
+		return keycloak.Config{
+			BaseURL:      os.Getenv("KEYCLOAK_BASE_URL"),
+			Realm:        os.Getenv("KEYCLOAK_REALM"),
+			ClientID:     os.Getenv("KEYCLOAK_CLIENT_ID"),
+			ClientSecret: os.Getenv("KEYCLOAK_CLIENT_SECRET"),
+		}
+	}
+
+	switch backend {
+	case "keycloak":
+		cfg := kcConfig()
+		if cfg.BaseURL == "" || cfg.Realm == "" || cfg.ClientID == "" {
+			return nil, fmt.Errorf("AUTHZ_BACKEND=keycloak requires KEYCLOAK_BASE_URL, KEYCLOAK_REALM and KEYCLOAK_CLIENT_ID")
+		}
+		logger.Info("authorization backend", "backend", "keycloak",
+			"realm", cfg.Realm, "client_id", cfg.ClientID)
+		return keycloak.NewAuthorizer(cfg, logger, keycloak.RealClock{}), nil
+
+	case "shadow":
+		file, err := authz.NewFileAuthorizer(policyPath)
+		if err != nil {
+			return nil, err
+		}
+		cfg := kcConfig()
+		if cfg.BaseURL == "" || cfg.Realm == "" || cfg.ClientID == "" {
+			return nil, fmt.Errorf("AUTHZ_BACKEND=shadow requires KEYCLOAK_BASE_URL, KEYCLOAK_REALM and KEYCLOAK_CLIENT_ID")
+		}
+		logger.Info("authorization backend", "backend", "shadow",
+			"authoritative", "file", "shadowed", "keycloak")
+		return authz.NewShadow(file,
+			keycloak.NewAuthorizer(cfg, logger, keycloak.RealClock{}), logger), nil
+
+	case "file", "":
+		logger.Info("authorization backend", "backend", "file", "path", policyPath)
+		return authz.NewFileAuthorizer(policyPath)
+
+	default:
+		return nil, fmt.Errorf("unknown AUTHZ_BACKEND %q (want file, keycloak or shadow)", backend)
+	}
+}
+
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -39,9 +88,9 @@ func main() {
 	table := envOr("DYNAMO_TABLE", "deploy-gateway-operations")
 	addr := ":" + envOr("PORT", "8080")
 
-	authorizer, err := authz.NewFileAuthorizer(policyPath)
+	authorizer, err := buildAuthorizer(os.Getenv("AUTHZ_BACKEND"), policyPath, logger)
 	if err != nil {
-		logger.Error("load policy", "err", err)
+		logger.Error("authorization backend", "err", err)
 		os.Exit(1)
 	}
 	verifier, err := authn.NewVerifier(ctx, oidcIssuer, audience)
