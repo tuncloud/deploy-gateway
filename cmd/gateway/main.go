@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -32,6 +33,37 @@ func envOr(key, def string) string {
 	return def
 }
 
+// requireKeycloakConfig fails the process at boot when a Keycloak-backed
+// backend is selected without complete configuration. This is a configuration
+// error, not a network dependency, so it is the one Keycloak-related thing
+// that should exit rather than degrade — in particular the secret: read but
+// unvalidated, a misspelled Secret key started cleanly and surfaced much later
+// as "keycloak: token endpoint returned 401", which sends the operator to
+// debug service-account roles instead of a missing value.
+//
+// The message names the variables and never their values: the client secret
+// must not reach a log line or an error string.
+func requireKeycloakConfig(backend string, cfg keycloak.Config) error {
+	var missing []string
+	for _, v := range []struct {
+		name, value string
+	}{
+		{"KEYCLOAK_BASE_URL", cfg.BaseURL},
+		{"KEYCLOAK_REALM", cfg.Realm},
+		{"KEYCLOAK_CLIENT_ID", cfg.ClientID},
+		{"KEYCLOAK_CLIENT_SECRET", cfg.ClientSecret},
+	} {
+		if v.value == "" {
+			missing = append(missing, v.name)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("AUTHZ_BACKEND=%s requires %s", backend,
+			strings.Join(missing, ", "))
+	}
+	return nil
+}
+
 // buildAuthorizer selects the authorization backend. Keycloak is resolved
 // lazily and never fails the process at boot: a Keycloak hiccup during a
 // gateway rollout must not produce a crashlooping gateway at the exact moment
@@ -49,8 +81,8 @@ func buildAuthorizer(backend, policyPath string, logger *slog.Logger) (authz.Aut
 	switch backend {
 	case "keycloak":
 		cfg := kcConfig()
-		if cfg.BaseURL == "" || cfg.Realm == "" || cfg.ClientID == "" {
-			return nil, fmt.Errorf("AUTHZ_BACKEND=keycloak requires KEYCLOAK_BASE_URL, KEYCLOAK_REALM and KEYCLOAK_CLIENT_ID")
+		if err := requireKeycloakConfig(backend, cfg); err != nil {
+			return nil, err
 		}
 		logger.Info("authorization backend", "backend", "keycloak",
 			"realm", cfg.Realm, "client_id", cfg.ClientID)
@@ -62,8 +94,8 @@ func buildAuthorizer(backend, policyPath string, logger *slog.Logger) (authz.Aut
 			return nil, err
 		}
 		cfg := kcConfig()
-		if cfg.BaseURL == "" || cfg.Realm == "" || cfg.ClientID == "" {
-			return nil, fmt.Errorf("AUTHZ_BACKEND=shadow requires KEYCLOAK_BASE_URL, KEYCLOAK_REALM and KEYCLOAK_CLIENT_ID")
+		if err := requireKeycloakConfig(backend, cfg); err != nil {
+			return nil, err
 		}
 		logger.Info("authorization backend", "backend", "shadow",
 			"authoritative", "file", "shadowed", "keycloak")
